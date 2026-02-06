@@ -1,0 +1,13 @@
+{
+  "arch": "yolov8n",
+  "dataset": "/Users/admin/sao-paulo-pool-estimator/data/processed/yolo/dataset.yaml",
+  "metrics": {
+    "metrics/precision(B)": 0.0005555555555555556,
+    "metrics/recall(B)": 0.5,
+    "metrics/mAP50(B)": 0.0005011437908496731,
+    "metrics/mAP50-95(B)": 0.00029544634310238796,
+    "fitness": 0.00029544634310238796
+  },
+  "best_checkpoint": "/Users/admin/sao-paulo-pool-estimator/reports/runs/sao-paulo-pools/weights/best.pt",
+  "last_checkpoint": "/Users/admin/sao-paulo-pool-estimator/reports/runs/sao-paulo-pools/weights/last.pt"
+}

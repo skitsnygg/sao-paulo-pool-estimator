@@ -1,0 +1,59 @@
+project:
+  name: sao-paulo-pools
+
+aoi:
+  name: sao_paulo_city
+  bbox: [-46.826, -23.800, -46.365, -23.356]  # [west, south, east, north]
+
+tiles:
+  zoom: 19
+  size: 256
+  max_tiles: 120000
+  download_threads: 8
+
+imagery:
+  tile_url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+  user_agent: "sao-paulo-pool-estimator/1.0"
+  rate_limit_s: 0.1
+
+osm:
+  endpoint: "https://overpass-api.de/api/interpreter"
+  timeout: 180
+  tags:
+    leisure: ["swimming_pool"]
+    amenity: ["swimming_pool"]
+
+# Dataset generation
+
+dataset:
+  train_ratio: 0.7
+  val_ratio: 0.2
+  test_ratio: 0.1
+  min_box_area_px: 30
+  random_seed: 42
+
+# Sampling and estimation
+
+sampling:
+  method: uniform  # uniform | stratified
+  sample_size: 2000
+  bootstrap_iters: 1000
+  random_seed: 42
+
+# Model training
+
+model:
+  arch: yolov8n
+  epochs: 100
+  imgsz: 640
+  batch: 16
+  device: cpu
+  patience: 20
+
+inference:
+  conf: 0.25
+  iou: 0.5
+  max_det: 300
+
+baseline:
+  blue_ratio_threshold: 0.02

@@ -1,0 +1,53 @@
+project:
+  name: sao-paulo-pools-quickstart
+
+aoi:
+  name: ibirapuera_area
+  bbox: [-46.700, -23.620, -46.630, -23.560]
+
+tiles:
+  zoom: 18
+  size: 256
+  max_tiles: 60
+  download_threads: 4
+
+imagery:
+  tile_url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+  user_agent: "sao-paulo-pool-estimator/1.0"
+  rate_limit_s: 0.1
+
+osm:
+  endpoint: "https://overpass-api.de/api/interpreter"
+  timeout: 120
+  tags:
+    leisure: ["swimming_pool"]
+    amenity: ["swimming_pool"]
+
+dataset:
+  train_ratio: 0.7
+  val_ratio: 0.2
+  test_ratio: 0.1
+  min_box_area_px: 20
+  random_seed: 7
+
+sampling:
+  method: uniform
+  sample_size: 100
+  bootstrap_iters: 200
+  random_seed: 7
+
+model:
+  arch: yolov8n
+  epochs: 10
+  imgsz: 640
+  batch: 8
+  device: cpu
+  patience: 5
+
+inference:
+  conf: 0.25
+  iou: 0.5
+  max_det: 200
+
+baseline:
+  blue_ratio_threshold: 0.003

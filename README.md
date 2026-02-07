@@ -43,11 +43,13 @@ Artifacts:
 ## Full pipeline (training)
 
 ```bash
-python -m src.data.download_tiles --config configs/project.yaml
 python -m src.data.fetch_osm --config configs/project.yaml
-python -m src.data.make_dataset --config configs/project.yaml
+python -m src.data.select_tiles --config configs/project.yaml
+python -m src.data.download_tiles --config configs/project.yaml --tiles-csv data/interim/tiles/train_tiles.csv --output data/raw/tiles/train_tiles.csv
+python -m src.data.download_tiles --config configs/project.yaml --tiles-csv data/interim/tiles/sample_tiles.csv --output data/raw/tiles/sample_tiles.csv
+python -m src.data.make_dataset --config configs/project.yaml --tiles-csv data/raw/tiles/train_tiles.csv
 python -m src.models.train --config configs/project.yaml
-python -m src.models.predict --config configs/project.yaml --weights path/to/best.pt
+python -m src.models.predict --config configs/project.yaml --weights path/to/best.pt --tiles-csv data/raw/tiles/sample_tiles.csv
 python -m src.analysis.estimate --config configs/project.yaml --predictions data/processed/predictions.csv
 python -m src.visualization.map --config configs/project.yaml --predictions data/processed/predictions.csv
 ```
@@ -63,8 +65,9 @@ Or run everything in order:
 ## Sampling strategy
 
 - AOI is split into Web Mercator tiles at a fixed zoom.
-- A uniform random sample of tiles is selected (configurable).
-- Pool counts are predicted per sampled tile.
+- Training tiles are built from all tiles intersecting OSM pools plus a controlled number of negatives (`training` in config).
+- Estimation tiles are a uniform random sample across the AOI (`sampling.sample_size`).
+- Pool counts are predicted on the estimation sample.
 - The city total is estimated as:
   - `mean_count_per_tile * total_tiles`
 - Bootstrap resampling provides a 95% confidence interval.

@@ -1,11 +1,11 @@
 {
   "method": "uniform",
-  "sample_tiles": 60,
-  "total_tiles": 2548,
-  "mean_count_per_tile": 0.1,
-  "estimate": 254.8,
+  "sample_tiles": 2193,
+  "total_tiles": 475811,
+  "mean_count_per_tile": 0.0,
+  "estimate": 0.0,
   "ci_95": [
-    84.93333333333334,
-    424.66666666666663
+    0.0,
+    0.0
   ]
 }

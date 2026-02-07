@@ -35,7 +35,35 @@ def _download_one(tile: TileSpec, output_dir: Path, url_template: str, headers: 
         return tile, path, "error"
 
 
-def download_tiles(config_path: str, max_tiles: int | None = None) -> Path:
+def _load_tiles_from_csv(tiles_csv: Path) -> list[TileSpec]:
+    df = pd.read_csv(tiles_csv)
+    tiles: list[TileSpec] = []
+    if {"z", "x", "y"}.issubset(df.columns):
+        for row in df.itertuples():
+            tiles.append(TileSpec(int(row.z), int(row.x), int(row.y)))
+    elif "tile_id" in df.columns:
+        for tile_id in df["tile_id"].tolist():
+            z, x, y = (int(part) for part in str(tile_id).split("_"))
+            tiles.append(TileSpec(z, x, y))
+    else:
+        raise ValueError("tiles_csv must include z/x/y columns or tile_id.")
+
+    seen = set()
+    unique_tiles = []
+    for tile in tiles:
+        if tile.id in seen:
+            continue
+        seen.add(tile.id)
+        unique_tiles.append(tile)
+    return unique_tiles
+
+
+def download_tiles(
+    config_path: str,
+    max_tiles: int | None = None,
+    tiles_csv: str | None = None,
+    output_csv: str | None = None,
+) -> Path:
     config = load_config(config_path)
     bbox = config["aoi"]["bbox"]
     zoom = config["tiles"]["zoom"]
@@ -45,10 +73,21 @@ def download_tiles(config_path: str, max_tiles: int | None = None) -> Path:
     rate_limit = config["imagery"].get("rate_limit_s", 0.0)
     headers = {"User-Agent": config["imagery"].get("user_agent", "pool-estimator")}
 
-    tiles = tiles_from_bbox(bbox, zoom)
-    tiles = sample_tiles(tiles, max_tiles, seed=config["dataset"].get("random_seed", 42))
+    if tiles_csv:
+        tiles = _load_tiles_from_csv(Path(tiles_csv))
+    else:
+        tiles = tiles_from_bbox(bbox, zoom)
+        tiles = sample_tiles(tiles, max_tiles, seed=config["dataset"].get("random_seed", 42))
 
     output_dir = project_root() / "data" / "raw" / "tiles"
+    ensure_dir(output_dir)
+    if output_csv:
+        metadata_path = Path(output_csv)
+        if not metadata_path.is_absolute():
+            metadata_path = project_root() / metadata_path
+        output_dir = metadata_path.parent
+    else:
+        metadata_path = output_dir / "tiles.csv"
     ensure_dir(output_dir)
 
     rows = []
@@ -61,7 +100,6 @@ def download_tiles(config_path: str, max_tiles: int | None = None) -> Path:
                 time.sleep(rate_limit)
 
     df = pd.DataFrame(rows).sort_values(["z", "x", "y"]).reset_index(drop=True)
-    metadata_path = output_dir / "tiles.csv"
     df.to_csv(metadata_path, index=False)
     return metadata_path
 
@@ -70,9 +108,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Download imagery tiles for the AOI.")
     parser.add_argument("--config", default="configs/project.yaml")
     parser.add_argument("--max-tiles", type=int, default=None)
+    parser.add_argument("--tiles-csv", default=None)
+    parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
-    metadata_path = download_tiles(args.config, args.max_tiles)
+    metadata_path = download_tiles(args.config, args.max_tiles, args.tiles_csv, args.output)
     print(f"Saved tile metadata to {metadata_path}")
 
 

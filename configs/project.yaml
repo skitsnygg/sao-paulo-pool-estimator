@@ -8,7 +8,7 @@ aoi:
 tiles:
   zoom: 19
   size: 256
-  max_tiles: 120000
+  max_tiles: 8000
   download_threads: 8
 
 imagery:
@@ -27,9 +27,14 @@ osm:
 
 dataset:
   train_ratio: 0.7
-  val_ratio: 0.2
-  test_ratio: 0.1
+  val_ratio: 0.15
+  test_ratio: 0.15
   min_box_area_px: 30
+  random_seed: 42
+
+training:
+  negatives_per_positive: 1.0
+  max_tiles: 10000
   random_seed: 42
 
 # Sampling and estimation
@@ -44,11 +49,11 @@ sampling:
 
 model:
   arch: yolov8n
-  epochs: 100
+  epochs: 30
   imgsz: 640
-  batch: 16
+  batch: 4
   device: cpu
-  patience: 20
+  patience: 10
 
 inference:
   conf: 0.25

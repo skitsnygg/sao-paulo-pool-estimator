@@ -11,9 +11,15 @@ Estimate the number of swimming pools in Sao Paulo by training a pool detector o
 
 The pipeline queries OSM for pool polygons within the AOI, downloads imagery tiles, and labels tiles by intersecting pool polygons with tile boundaries.
 
+## Tile selection
+
+- Training tiles include all tiles that intersect OSM pool polygons plus a configurable number of random negative tiles.
+- Estimation tiles are a uniform random sample of all tiles in the AOI.
+- This separation keeps training data pool-heavy while preserving unbiased city-wide estimates.
+
 ## Dataset construction
 
-- Each tile is treated as an image chip.
+- Each training tile is treated as an image chip.
 - For each tile, pool polygons that intersect the tile are clipped to tile boundaries and converted to bounding boxes.
 - Images + labels are exported in YOLO format with a single class: `pool`.
 - Train/val/test splits are random and reproducible via a seed in `configs/project.yaml`.
@@ -35,6 +41,8 @@ Let:
 - `N` = total tiles in the AOI at the selected zoom
 - `n` = sampled tiles with predictions
 - `y_i` = predicted pool count on tile `i`
+
+Predictions are generated on the estimation tile sample (not the training split).
 
 Uniform estimator:
 

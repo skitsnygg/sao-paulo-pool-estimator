@@ -47,19 +47,21 @@ def _assign_splits(tiles: list[TileSpec], ratios: dict, seed: int) -> dict[str, 
     return splits
 
 
-def make_dataset(config_path: str, min_box_area: int | None = None) -> Path:
+def make_dataset(config_path: str, min_box_area: int | None = None, tiles_csv: str | None = None) -> Path:
     config = load_config(config_path)
     root = project_root()
 
-    tiles_csv = root / "data" / "raw" / "tiles" / "tiles.csv"
-    if not tiles_csv.exists():
-        raise FileNotFoundError(f"Missing tiles metadata: {tiles_csv}")
+    tiles_csv_path = Path(tiles_csv) if tiles_csv else root / "data" / "raw" / "tiles" / "tiles.csv"
+    if not tiles_csv_path.is_absolute():
+        tiles_csv_path = root / tiles_csv_path
+    if not tiles_csv_path.exists():
+        raise FileNotFoundError(f"Missing tiles metadata: {tiles_csv_path}")
 
     osm_path = root / "data" / "raw" / "osm_pools.geojson"
     if not osm_path.exists():
         raise FileNotFoundError(f"Missing OSM pools data: {osm_path}")
 
-    tiles_df = pd.read_csv(tiles_csv)
+    tiles_df = pd.read_csv(tiles_csv_path)
     tiles_df = tiles_df[tiles_df["status"].isin(["downloaded", "cached"])].copy()
 
     tiles = [TileSpec(int(row.z), int(row.x), int(row.y)) for row in tiles_df.itertuples()]
@@ -156,9 +158,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build YOLO dataset from tiles + OSM pools.")
     parser.add_argument("--config", default="configs/project.yaml")
     parser.add_argument("--min-box-area", type=int, default=None)
+    parser.add_argument("--tiles-csv", default=None)
     args = parser.parse_args()
 
-    dataset_yaml = make_dataset(args.config, args.min_box_area)
+    dataset_yaml = make_dataset(args.config, args.min_box_area, args.tiles_csv)
     print(f"Saved dataset config to {dataset_yaml}")
 
 

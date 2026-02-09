@@ -119,7 +119,13 @@ def make_dataset(config_path: str, min_box_area: int | None = None, tiles_csv: s
             shutil.copyfile(src_path, dst_image)
 
             ensure_dir(dst_label.parent)
-            dst_label.write_text("\n".join(labels) + ("\n" if labels else ""), encoding="utf-8")
+            # Only write the label file if there are valid labels
+            if labels:
+                dst_label.write_text("\n".join(labels) + "\n", encoding="utf-8")
+            else:
+                # Don't create empty label files - this can cause issues during training
+                # The file will be missing, which is handled by the training script
+                pass
 
             rows.append(
                 {

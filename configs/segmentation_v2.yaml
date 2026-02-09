@@ -1,0 +1,10 @@
+project:
+  name: sao-paulo-pools-seg-v2
+
+model:
+  arch: yolov8s-seg
+  epochs: 50
+  imgsz: 1024
+  batch: 2
+  device: cpu
+  patience: 10

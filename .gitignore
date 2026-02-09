@@ -21,3 +21,16 @@ checkpoints/*
 !checkpoints/.gitkeep
 
 reports/runs/*
+# macOS
+.DS_Store
+
+# local outputs / artifacts
+reports/
+scratch/
+data/processed/
+data/raw/
+data/annotations/.DS_Store
+data/annotations/**/.DS_Store
+
+# training logs
+reports/logs/

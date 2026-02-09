@@ -21,31 +21,47 @@ def _serialize_metrics(metrics) -> dict:
         return {k: v for k, v in vars(metrics).items() if not k.startswith("_")}
 
 
-def train_model(config_path: str) -> Path:
+def train_model(
+    config_path: str,
+    dataset_yaml: str | None = None,
+    arch_override: str | None = None,
+    resume: bool = False,
+) -> Path:
     config = load_config(config_path)
     root = project_root()
-    dataset_yaml = root / "data" / "processed" / "yolo" / "dataset.yaml"
-    if not dataset_yaml.exists():
-        raise FileNotFoundError(f"Missing dataset config: {dataset_yaml}")
+    dataset_yaml_path = Path(dataset_yaml) if dataset_yaml else root / "data" / "processed" / "yolo" / "dataset.yaml"
+    if not dataset_yaml_path.is_absolute():
+        dataset_yaml_path = root / dataset_yaml_path
+    if not dataset_yaml_path.exists():
+        raise FileNotFoundError(f"Missing dataset config: {dataset_yaml_path}")
 
     try:
         from ultralytics import YOLO
     except ImportError as exc:
         raise ImportError("ultralytics is required. Install requirements-train.txt") from exc
 
-    arch = config["model"].get("arch", "yolov8n")
-    model = YOLO(f"{arch}.pt")
+    run_name = config.get("project", {}).get("name", "train")
+    resume_path = root / "reports" / "runs" / run_name / "weights" / "last.pt"
+    if resume:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Missing resume checkpoint: {resume_path}")
+        arch = arch_override or resume_path.stem
+        model = YOLO(str(resume_path))
+    else:
+        arch = arch_override or config["model"].get("arch", "yolov8n")
+        model = YOLO(f"{arch}.pt")
 
     results = model.train(
-        data=str(dataset_yaml),
+        data=str(dataset_yaml_path),
         epochs=config["model"].get("epochs", 50),
         imgsz=config["model"].get("imgsz", 640),
         batch=config["model"].get("batch", 16),
         device=config["model"].get("device", "cpu"),
         patience=config["model"].get("patience", 20),
         project=str(root / "reports" / "runs"),
-        name=config.get("project", {}).get("name", "train"),
+        name=run_name,
         exist_ok=True,
+        resume=resume,
     )
 
     trainer = getattr(model, "trainer", None)
@@ -64,12 +80,14 @@ def train_model(config_path: str) -> Path:
 
     output = {
         "arch": arch,
-        "dataset": str(dataset_yaml),
+        "dataset": str(dataset_yaml_path),
         "metrics": metrics,
         "best_checkpoint": str(best_path) if best_path else "",
         "last_checkpoint": str(last_path) if last_path else "",
         "copied_best": str(checkpoints_dir / "best.pt") if best_path and best_path.exists() else "",
         "copied_last": str(checkpoints_dir / "last.pt") if last_path and last_path.exists() else "",
+        "resume": resume,
+        "resume_checkpoint": str(resume_path) if resume else "",
     }
 
     reports_dir = root / "reports" / "logs"
@@ -82,9 +100,12 @@ def train_model(config_path: str) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train YOLO model for pool detection.")
     parser.add_argument("--config", default="configs/project.yaml")
+    parser.add_argument("--dataset-yaml", default=None)
+    parser.add_argument("--arch", default=None)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
-    output_path = train_model(args.config)
+    output_path = train_model(args.config, args.dataset_yaml, args.arch, args.resume)
     print(f"Saved training metrics to {output_path}")
 
 

@@ -1,6 +1,6 @@
-# How Many Pools in Sao Paulo?
+# How Many Pools in São Paulo?
 
-Estimate the number of swimming pools in Sao Paulo using aerial imagery + ML, with a reproducible pipeline from data collection to city-wide estimates.
+A AI training repo with the end goal of estimating the number of swimming pools in São Paulo (visible) using aerial imagery + ML, with a reproducible pipeline from data collection to city-wide estimates.
 
 ## What is included
 

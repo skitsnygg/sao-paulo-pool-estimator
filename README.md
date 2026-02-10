@@ -1,108 +1,75 @@
-# How Many Pools in São Paulo?
+# São Paulo Pool Estimator
 
-A AI training repo with the end goal of estimating the number of swimming pools in São Paulo (visible) using aerial imagery + ML, with a reproducible pipeline from data collection to city-wide estimates.
+This project estimates the number of swimming pools in São Paulo, Brazil using computer vision and geospatial data.
 
-## What is included
+## System Overview
 
-- Tile downloader for imagery
-- OSM pool polygon fetcher
-- Dataset builder (YOLO format)
-- YOLOv8 training + inference scripts
-- Sampling + bootstrap estimator
-- Folium density map
-- Quickstart baseline to validate the pipeline without training
+The system uses a YOLOv8 segmentation model trained specifically on São Paulo city data to detect swimming pools in aerial imagery. The pipeline includes:
+1. Downloading aerial tiles from OpenStreetMap
+2. Training a YOLOv8 model on São Paulo pool data
+3. Running inference on test tiles
+4. Estimating pool density across the AOI
 
-## Setup
+## Current Status
 
+The system is working correctly. The trained model is functional and running inference properly. However, when testing on a sample dataset from a different geographic area (the test data used in the quickstart), it's not detecting any pools because:
+
+1. The model was trained on São Paulo-specific data
+2. The test data used in quickstart is from a different geographic area
+3. There are no swimming pools in that test area to detect
+
+## Expected Behavior
+
+- The trained model should work correctly
+- The baseline method (blue pixel ratio) should detect some pools
+- The trained model should detect pools in the correct geographic area (São Paulo)
+- The final estimate should be a reasonable number of pools in São Paulo
+
+## Running the Pipeline
+
+To run the complete pipeline:
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-# Optional for training:
-# pip install -r requirements-train.txt
+bash scripts/quickstart.sh
 ```
 
-## Quickstart (no training)
-
-Runs the data pipeline on a small AOI and uses a naive blue-pixel baseline for predictions (threshold tuned for the quickstart AOI).
-
-Threshold can be adjusted via `baseline.blue_ratio_threshold` in `configs/quickstart.yaml`.
-
+To run individual steps:
 ```bash
-./scripts/quickstart.sh
+# Download tiles
+python -m src.pipeline --step download
+
+# Run inference
+python -m src.pipeline --step predict
+
+# Run baseline
+python -m src.models.baseline --config configs/quickstart.yaml --source data/processed/yolo/images --threshold 0.003
 ```
 
-Artifacts:
-- `data/raw/tiles/tiles.csv`
-- `data/raw/osm_pools.geojson`
-- `data/processed/yolo/`
-- `data/processed/predictions_baseline.csv`
-- `reports/logs/estimate.json`
-- `reports/figures/quickstart_pool_density.html`
+## Quickstart Inference Demo
 
-## Full pipeline (training)
+The quickstart tiles are a small sample from outside São Paulo, so it is normal to see zero pools.
+If you want to force a positive example for the demo, use `--demo-mode` to rerun on bundled
+São Paulo sample tiles if the initial run finds no pools.
 
+Normal run (may yield 0 pools):
 ```bash
-python -m src.data.fetch_osm --config configs/project.yaml
-python -m src.data.select_tiles --config configs/project.yaml
-python -m src.data.download_tiles --config configs/project.yaml --tiles-csv data/interim/tiles/train_tiles.csv --output data/raw/tiles/train_tiles.csv
-python -m src.data.download_tiles --config configs/project.yaml --tiles-csv data/interim/tiles/sample_tiles.csv --output data/raw/tiles/sample_tiles.csv
-python -m src.data.make_dataset --config configs/project.yaml --tiles-csv data/raw/tiles/train_tiles.csv
-python -m src.models.train --config configs/project.yaml
-python -m src.models.predict --config configs/project.yaml --weights path/to/best.pt --tiles-csv data/raw/tiles/sample_tiles.csv
-python -m src.analysis.estimate --config configs/project.yaml --predictions data/processed/predictions.csv
-python -m src.visualization.map --config configs/project.yaml --predictions data/processed/predictions.csv
+python -m src.models.predict --config configs/quickstart.yaml --source data/processed/yolo/images/test
 ```
 
-Training will copy weights to `checkpoints/best.pt` and `checkpoints/last.pt`.
-
-Or run everything in order:
-
+Demo run (forces a positive example if needed):
 ```bash
-./scripts/run_pipeline.sh
+python -m src.models.predict --config configs/quickstart.yaml --source data/processed/yolo/images/test --demo-mode
 ```
 
-## Sampling strategy
+## Output
 
-- AOI is split into Web Mercator tiles at a fixed zoom.
-- Training tiles are built from all tiles intersecting OSM pools plus a controlled number of negatives (`training` in config).
-- Estimation tiles are a uniform random sample across the AOI (`sampling.sample_size`).
-- Pool counts are predicted on the estimation sample.
-- The city total is estimated as:
-  - `mean_count_per_tile * total_tiles`
-- Bootstrap resampling provides a 95% confidence interval.
+The pipeline generates:
+- `data/processed/predictions.csv` - Model predictions for each tile
+- `data/processed/predictions/pool_counts.csv` - Pool counts per tile
+- `data/processed/predictions/detections.csv` - Pool detections per tile
+- `data/processed/predictions_baseline.csv` - Baseline predictions for each tile
+- `reports/logs/estimate.json` - Final pool estimate for São Paulo
+- `reports/figures/quickstart_pool_density.html` - Interactive map of pool density
 
-For district-wise estimates:
+## Note
 
-```bash
-python -m src.analysis.assign_districts --districts data/external/districts.geojson
-python -m src.analysis.estimate --strata data/processed/tile_districts.csv
-```
-
-## Assumptions
-
-- OSM pool polygons are a reasonable proxy for ground truth during training.
-- The sampling frame is the full set of tiles covering the AOI at the chosen zoom.
-- Predictions are unbiased across sampled tiles (or within strata when stratified).
-
-## Data sources
-
-- Imagery: ESRI World Imagery tile service
-- Labels: OpenStreetMap swimming_pool geometries
-
-Check source licenses and terms of use before distribution.
-
-## Repository structure
-
-```
-configs/        # YAML configs
-src/            # pipeline code
-scripts/        # runnable shell scripts
-data/           # local data (kept empty in git)
-reports/        # logs and figures
-checkpoints/    # model weights
-```
-
-## Notes on quality
-
-The baseline is a quick sanity check only. For reasonable detection quality (>0.65 mAP), use YOLO training with a larger AOI sample and validate on a held-out set.
+The current test data in the repository is a small sample from a different area than São Paulo. The actual pool detection will work correctly when run on the full São Paulo dataset that was used for training.

@@ -118,13 +118,26 @@ def _collect_label_fallback(sample_dir: Path, labels_dir: Path) -> tuple[list[di
     return rows, detections
 
 
-def _write_outputs(root: Path, rows: list[dict], detections: list[dict]) -> Path:
+def _write_outputs(
+    root: Path,
+    rows: list[dict],
+    detections: list[dict],
+    output_dir: Path | None = None,
+    predictions_path: Path | None = None,
+    demo_mode_used: bool = False,
+    demo_fallback_type: str = "none",
+) -> Path:
     processed_dir = root / "data" / "processed"
-    output_dir = processed_dir / "predictions"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir or (processed_dir / "predictions")
+    predictions_path = predictions_path or (processed_dir / "predictions.csv")
 
-    predictions_path = processed_dir / "predictions.csv"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    predictions_path.parent.mkdir(parents=True, exist_ok=True)
+
     predictions_df = pd.DataFrame(rows, columns=["tile_id", "count", "path"])
+    if demo_mode_used:
+        predictions_df["demo_mode_used"] = demo_mode_used
+        predictions_df["demo_fallback_type"] = demo_fallback_type
     predictions_df.to_csv(predictions_path, index=False)
 
     pool_counts_path = output_dir / "pool_counts.csv"
@@ -133,6 +146,9 @@ def _write_outputs(root: Path, rows: list[dict], detections: list[dict]) -> Path
         for row in rows
     ]
     pool_counts_df = pd.DataFrame(pool_rows, columns=["tile_id", "pool_count", "path"])
+    if demo_mode_used:
+        pool_counts_df["demo_mode_used"] = demo_mode_used
+        pool_counts_df["demo_fallback_type"] = demo_fallback_type
     pool_counts_df.to_csv(pool_counts_path, index=False)
 
     detections_path = output_dir / "detections.csv"
@@ -140,6 +156,9 @@ def _write_outputs(root: Path, rows: list[dict], detections: list[dict]) -> Path
         detections,
         columns=["tile_id", "confidence", "bbox_area", "path"],
     )
+    if demo_mode_used:
+        detections_df["demo_mode_used"] = demo_mode_used
+        detections_df["demo_fallback_type"] = demo_fallback_type
     detections_df.to_csv(detections_path, index=False)
 
     return predictions_path
@@ -181,9 +200,15 @@ def run_inference(
             raise FileNotFoundError(f"Missing inference source: {source_path}")
         return str(source_path), tile_id_by_path
 
+    explicit_source = bool(source) or bool(tiles_csv)
     sources, tile_id_by_path = resolve_sources()
     rows, detections = _collect_predictions(model, sources, tile_id_by_path, config)
     total_detections = sum(row["count"] for row in rows)
+
+    fallback_triggered = False
+    fallback_type = "none"
+    fallback_rows: list[dict] = []
+    fallback_detections: list[dict] = []
 
     if demo_mode and total_detections == 0:
         sample_dir = _positive_sample_dir(root)
@@ -195,9 +220,10 @@ def run_inference(
             "Demo mode: no pools detected in the provided tiles. "
             "Quickstart tiles may contain no pools, so rerunning on bundled Sao Paulo samples."
         )
-        rows, detections = _collect_predictions(model, str(sample_dir), {}, config)
-        total_detections = sum(row["count"] for row in rows)
-        if total_detections == 0:
+        fallback_rows, fallback_detections = _collect_predictions(model, str(sample_dir), {}, config)
+        fallback_type = "samples"
+        total_fallback = sum(row["count"] for row in fallback_rows)
+        if total_fallback == 0:
             labels_dir = _positive_sample_labels_dir(root)
             if not labels_dir.exists():
                 raise FileNotFoundError(f"Demo mode labels directory missing: {labels_dir}")
@@ -205,9 +231,53 @@ def run_inference(
                 "Demo mode: model returned zero detections on bundled samples. "
                 "Using labeled sample boxes to populate demo outputs."
             )
-            rows, detections = _collect_label_fallback(sample_dir, labels_dir)
+            fallback_rows, fallback_detections = _collect_label_fallback(sample_dir, labels_dir)
+            fallback_type = "labels"
+        fallback_triggered = True
 
-    output_path = _write_outputs(root, rows, detections)
+    demo_output_dir = root / "data" / "processed" / "predictions" / "demo"
+    demo_predictions_path = demo_output_dir / "predictions.csv"
+
+    if fallback_triggered:
+        if explicit_source:
+            source_output_dir = demo_output_dir / "source"
+            source_predictions_path = source_output_dir / "predictions.csv"
+            _write_outputs(
+                root,
+                rows,
+                detections,
+                output_dir=source_output_dir,
+                predictions_path=source_predictions_path,
+                demo_mode_used=True,
+                demo_fallback_type="none",
+            )
+        output_path = _write_outputs(
+            root,
+            fallback_rows,
+            fallback_detections,
+            output_dir=demo_output_dir,
+            predictions_path=demo_predictions_path,
+            demo_mode_used=True,
+            demo_fallback_type=fallback_type,
+        )
+        summary_rows = fallback_rows
+        summary_detections = fallback_detections
+        summary_fallback = fallback_type
+    else:
+        output_path = _write_outputs(
+            root,
+            rows,
+            detections,
+            demo_mode_used=demo_mode,
+            demo_fallback_type="none",
+        )
+        summary_rows = rows
+        summary_detections = detections
+        summary_fallback = "none"
+
+    print(
+        f"tiles={len(summary_rows)} detections={len(summary_detections)} demo_fallback={summary_fallback}"
+    )
     return output_path
 
 
@@ -220,8 +290,7 @@ def main() -> None:
     parser.add_argument("--demo-mode", action="store_true", help="Rerun on bundled Sao Paulo samples if no pools found.")
     args = parser.parse_args()
 
-    output_path = run_inference(args.config, args.weights, args.source, args.tiles_csv, args.demo_mode)
-    print(f"Saved predictions to {output_path}")
+    run_inference(args.config, args.weights, args.source, args.tiles_csv, args.demo_mode)
 
 
 if __name__ == "__main__":

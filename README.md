@@ -4,73 +4,69 @@ This project estimates the number of swimming pools in São Paulo, Brazil using 
 
 ## System Overview
 
-The system uses a YOLOv8 segmentation model trained specifically on São Paulo city data to detect swimming pools in aerial imagery. The pipeline includes:
-1. Downloading aerial tiles from OpenStreetMap
-2. Training a YOLOv8 model on São Paulo pool data
-3. Running inference on test tiles
-4. Estimating pool density across the AOI
+- YOLOv8 segmentation model trained on São Paulo imagery.
+- Pipeline steps:
+  - Download tiles from OpenStreetMap.
+  - Train the model on São Paulo pool data.
+  - Run inference on tiles.
+  - Estimate pool density across the AOI.
 
 ## Current Status
 
-The system is working correctly. The trained model is functional and running inference properly. However, when testing on a sample dataset from a different geographic area (the test data used in the quickstart), it's not detecting any pools because:
-
-1. The model was trained on São Paulo-specific data
-2. The test data used in quickstart is from a different geographic area
-3. There are no swimming pools in that test area to detect
+- Model runs and produces predictions.
+- Quickstart tiles are outside São Paulo.
+- Zero pools in quickstart is expected.
 
 ## Expected Behavior
 
-- The trained model should work correctly
-- The baseline method (blue pixel ratio) should detect some pools
-- The trained model should detect pools in the correct geographic area (São Paulo)
-- The final estimate should be a reasonable number of pools in São Paulo
+- Trained model detects pools in São Paulo imagery.
+- Baseline method detects some pools.
+- Estimates are reasonable for the AOI.
 
 ## Running the Pipeline
 
-To run the complete pipeline:
-```bash
-bash scripts/quickstart.sh
-```
+- Full pipeline:
+  ```bash
+  bash scripts/quickstart.sh
+  ```
+- Individual steps:
+  ```bash
+  # Download tiles
+  python -m src.pipeline --step download
 
-To run individual steps:
-```bash
-# Download tiles
-python -m src.pipeline --step download
+  # Run inference
+  python -m src.pipeline --step predict
 
-# Run inference
-python -m src.pipeline --step predict
-
-# Run baseline
-python -m src.models.baseline --config configs/quickstart.yaml --source data/processed/yolo/images --threshold 0.003
-```
+  # Run baseline
+  python -m src.models.baseline --config configs/quickstart.yaml --source data/processed/yolo/images --threshold 0.003
+  ```
 
 ## Quickstart Inference Demo
 
-The quickstart tiles are a small sample from outside São Paulo, so it is normal to see zero pools.
-If you want to force a positive example for the demo, use `--demo-mode` to rerun on bundled
-São Paulo sample tiles if the initial run finds no pools. If the model still returns zero on the
-bundled samples, demo mode falls back to the labeled sample boxes to ensure non-zero outputs.
+- Quickstart tiles may contain no pools.
+- Demo mode reruns on bundled São Paulo samples if needed.
+- If the model still returns zero, demo mode falls back to labeled sample boxes.
 
-Normal run (may yield 0 pools):
-```bash
-python -m src.models.predict --config configs/quickstart.yaml --source data/processed/yolo/images/test
-```
+- Normal run (may yield 0 pools):
+  ```bash
+  python -m src.models.predict --config configs/quickstart.yaml --source data/processed/yolo/images/test
+  ```
 
-Demo run (forces a positive example if needed):
-```bash
-python -m src.models.predict --config configs/quickstart.yaml --source data/processed/yolo/images/test --demo-mode
-```
+- Demo run (forces a positive example if needed):
+  ```bash
+  python -m src.models.predict --config configs/quickstart.yaml --source data/processed/yolo/images/test --demo-mode
+  ```
 
-## Output
+## Outputs
 
-The pipeline generates:
-- `data/processed/predictions.csv` - Model predictions for each tile
-- `data/processed/predictions/pool_counts.csv` - Pool counts per tile
-- `data/processed/predictions/detections.csv` - Pool detections per tile
-- `data/processed/predictions_baseline.csv` - Baseline predictions for each tile
-- `reports/logs/estimate.json` - Final pool estimate for São Paulo
-- `reports/figures/quickstart_pool_density.html` - Interactive map of pool density
+- `data/processed/predictions.csv` - Model predictions for each tile.
+- `data/processed/predictions/pool_counts.csv` - Pool counts per tile.
+- `data/processed/predictions/detections.csv` - Pool detections per tile.
+- `data/processed/predictions_baseline.csv` - Baseline predictions for each tile.
+- `reports/logs/estimate.json` - Final pool estimate for São Paulo.
+- `reports/figures/quickstart_pool_density.html` - Interactive map of pool density.
 
-## Note
+## Notes
 
-The current test data in the repository is a small sample from a different area than São Paulo. The actual pool detection will work correctly when run on the full São Paulo dataset that was used for training.
+- Quickstart uses a small non-São Paulo sample.
+- Use the full São Paulo dataset for real detection results.

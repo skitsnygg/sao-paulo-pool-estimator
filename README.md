@@ -48,7 +48,8 @@ python -m src.models.baseline --config configs/quickstart.yaml --source data/pro
 
 The quickstart tiles are a small sample from outside São Paulo, so it is normal to see zero pools.
 If you want to force a positive example for the demo, use `--demo-mode` to rerun on bundled
-São Paulo sample tiles if the initial run finds no pools.
+São Paulo sample tiles if the initial run finds no pools. If the model still returns zero on the
+bundled samples, demo mode falls back to the labeled sample boxes to ensure non-zero outputs.
 
 Normal run (may yield 0 pools):
 ```bash

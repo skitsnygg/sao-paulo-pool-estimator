@@ -1,0 +1,7 @@
+path: data/test_dataset
+train: images/train
+val: images/val
+
+# Classes
+nc: 1
+names: [pool]

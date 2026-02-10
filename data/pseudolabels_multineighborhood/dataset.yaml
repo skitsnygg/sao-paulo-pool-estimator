@@ -1,0 +1,7 @@
+path: data/pseudolabels_multineighborhood
+train: images/train
+val: images/val
+
+# Classes
+nc: 1
+names: [pool]

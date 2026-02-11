@@ -1,6 +1,6 @@
-# ========================================
+# ================================
 # Python
-# ========================================
+# ================================
 .venv/
 __pycache__/
 *.py[cod]
@@ -8,66 +8,50 @@ __pycache__/
 dist/
 build/
 
-# ========================================
+# ================================
 # IDE
-# ========================================
+# ================================
 .idea/
 
-# ========================================
+# ================================
 # macOS
-# ========================================
+# ================================
 .DS_Store
 **/.DS_Store
 
-# ========================================
-# Model Weights
-# ========================================
+# ================================
+# Model weights / exports
+# ================================
 *.pt
-yolov8*.pt
 
-# ========================================
-# YOLO / Training Artifacts
-# ========================================
+# ================================
+# YOLO / training outputs
+# ================================
 runs/
 
-# ========================================
-# Data (ignore contents, keep structure)
-# ========================================
-data/raw/*
-data/interim/*
-data/processed/*
-data/external/*
+# ================================
+# Big data dirs (keep .gitkeep)
+# ================================
+data/**
+!data/
+!data/raw/
+!data/interim/
+!data/processed/
+!data/external/
+!data/**/.gitkeep
 
-!data/raw/.gitkeep
-!data/interim/.gitkeep
-!data/processed/.gitkeep
-!data/external/.gitkeep
-
-# ========================================
-# Checkpoints (ignore contents, keep structure)
-# ========================================
-checkpoints/*
-
+checkpoints/**
+!checkpoints/
 !checkpoints/.gitkeep
 
-# ========================================
-# Reports & Generated Outputs
-# ========================================
-reports/*
+# ================================
+# Reports & scratch (usually generated)
+# ================================
+reports/
 scratch/
 
-# If you later want to keep static docs, comment the above
-# and instead ignore only logs:
-# reports/logs/*
-
-# ========================================
-# Geospatial Tile Dumps
-# ========================================
+# ================================
+# Large geospatial tile dumps
+# ================================
 tiles_2017/
 tiles_Orto_PMD_RGB_2017/
-
-# ========================================
-# Inference / Geo Outputs
-# ========================================
-*.geojson
-*.html

@@ -1,4 +1,79 @@
-name: geojson_dedupe_ci.yml
+name: GeoJSON Dedupe + Audit CI
+
 on:
+  push:
+  pull_request:
 
 jobs:
+  geojson-dedupe-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install deps
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install -U pip
+          # Install both if present (your repo has requirements.txt and requirements-train.txt)
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+          if [ -f requirements-train.txt ]; then python -m pip install -r requirements-train.txt; fi
+
+      - name: Compile tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m py_compile tools/dedupe_geojson_polygons.py tools/audit_geojson_overlaps.py
+
+      - name: Unit tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: End-to-end dedupe then audit (synthetic fixture)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/geojson_ci
+
+          # 1) Create a small GeoJSON with two overlapping polygons + one separate
+          python - <<'PY'
+          import json
+          from shapely.geometry import Polygon, mapping
+
+          def feat(geom, fid):
+            return {"type": "Feature", "id": fid, "properties": {"id": fid}, "geometry": mapping(geom)}
+
+          a = Polygon([(0,0),(2,0),(2,2),(0,2),(0,0)])
+          b = Polygon([(0.5,0.5),(2.5,0.5),(2.5,2.5),(0.5,2.5),(0.5,0.5)])  # overlaps a
+          c = Polygon([(10,10),(11,10),(11,11),(10,11),(10,10)])              # separate
+
+          gj = {"type": "FeatureCollection", "features": [feat(a,"a"), feat(b,"b"), feat(c,"c")]}
+          with open("/tmp/geojson_ci/in.geojson", "w", encoding="utf-8") as f:
+            json.dump(gj, f)
+          PY
+
+          # 2) Dedupe with IoU threshold
+          python tools/dedupe_geojson_polygons.py \
+            --in-geojson /tmp/geojson_ci/in.geojson \
+            --out-geojson /tmp/geojson_ci/out.geojson \
+            --iou 0.35 \
+            --stats \
+            --precision 7 \
+            --top-k 10
+
+          # 3) Audit output must have 0 pairs above threshold (exit code 0)
+          python tools/audit_geojson_overlaps.py \
+            --in-geojson /tmp/geojson_ci/out.geojson \
+            --iou 0.35 \
+            --top-k 10

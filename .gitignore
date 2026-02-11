@@ -1,36 +1,66 @@
+# ================================
+# Python
+# ================================
 .venv/
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 *.egg-info/
 dist/
 build/
 
+# ================================
+# IDE
+# ================================
 .idea/
 
+# ================================
+# macOS
+# ================================
+.DS_Store
+**/.DS_Store
+
+# ================================
+# Model Weights
+# ================================
+*.pt
 yolov8*.pt
 
-data/raw/*
-data/interim/*
-data/processed/*
-data/external/*
+# ================================
+# Data (large / generated)
+# ================================
+data/raw/
+data/interim/
+data/processed/
+data/external/
+
+# Keep folder structure if needed
 !data/**/.gitkeep
 
-checkpoints/*
+# ================================
+# Training / Checkpoints
+# ================================
+checkpoints/
 !checkpoints/.gitkeep
 
-reports/runs/*
-# macOS
-.DS_Store
+runs/
 
-# local outputs / artifacts
+# ================================
+# Reports & Outputs
+# ================================
 reports/
 scratch/
-data/processed/
-data/raw/
-data/annotations/.DS_Store
-data/annotations/**/.DS_Store
 
-# training logs
-reports/logs/
+# If you want to keep reports folder but ignore logs only, use instead:
+# reports/logs/
+
+# ================================
+# Geospatial / Tile Dumps
+# ================================
+tiles_2017/
+tiles_Orto_PMD_RGB_2017/
+
+# ================================
+# Misc
+# ================================
+*.geojson
+*.html

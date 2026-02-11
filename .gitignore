@@ -1,6 +1,6 @@
-# ================================
+# ========================================
 # Python
-# ================================
+# ========================================
 .venv/
 __pycache__/
 *.py[cod]
@@ -8,59 +8,66 @@ __pycache__/
 dist/
 build/
 
-# ================================
+# ========================================
 # IDE
-# ================================
+# ========================================
 .idea/
 
-# ================================
+# ========================================
 # macOS
-# ================================
+# ========================================
 .DS_Store
 **/.DS_Store
 
-# ================================
+# ========================================
 # Model Weights
-# ================================
+# ========================================
 *.pt
 yolov8*.pt
 
-# ================================
-# Data (large / generated)
-# ================================
-data/raw/
-data/interim/
-data/processed/
-data/external/
-
-# Keep folder structure if needed
-!data/**/.gitkeep
-
-# ================================
-# Training / Checkpoints
-# ================================
-checkpoints/
-!checkpoints/.gitkeep
-
+# ========================================
+# YOLO / Training Artifacts
+# ========================================
 runs/
 
-# ================================
-# Reports & Outputs
-# ================================
-reports/
+# ========================================
+# Data (ignore contents, keep structure)
+# ========================================
+data/raw/*
+data/interim/*
+data/processed/*
+data/external/*
+
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+!data/external/.gitkeep
+
+# ========================================
+# Checkpoints (ignore contents, keep structure)
+# ========================================
+checkpoints/*
+
+!checkpoints/.gitkeep
+
+# ========================================
+# Reports & Generated Outputs
+# ========================================
+reports/*
 scratch/
 
-# If you want to keep reports folder but ignore logs only, use instead:
-# reports/logs/
+# If you later want to keep static docs, comment the above
+# and instead ignore only logs:
+# reports/logs/*
 
-# ================================
-# Geospatial / Tile Dumps
-# ================================
+# ========================================
+# Geospatial Tile Dumps
+# ========================================
 tiles_2017/
 tiles_Orto_PMD_RGB_2017/
 
-# ================================
-# Misc
-# ================================
+# ========================================
+# Inference / Geo Outputs
+# ========================================
 *.geojson
 *.html

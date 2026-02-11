@@ -147,6 +147,8 @@ def save_segmentation_result(
     save_images: bool = True,
     save_labels: bool = True,
     save_geojson: bool = True,
+    min_area_px: int = 0,
+    max_area_px: int = 0,
 ) -> Tuple[List[Tuple[str, float, float]], int]:
     """
     Run inference on a single image and save results.
@@ -209,6 +211,10 @@ def save_segmentation_result(
                 # Calculate confidence and area
                 confidence = float(box.conf[0].cpu().numpy())
                 area = float((x2 - x1) * (y2 - y1))
+
+                # Apply area filtering if specified
+                if (min_area_px > 0 and area < min_area_px) or (max_area_px > 0 and area > max_area_px):
+                    continue
 
                 if label_file is not None:
                     # Convert to YOLO format (cx, cy, w, h)
@@ -309,6 +315,10 @@ def main():
                         help="Save YOLO format labels")
     parser.add_argument("--save-csv", action="store_true",
                         help="Save CSV with detections")
+    parser.add_argument("--min-area-px", type=int, default=0,
+                        help="Minimum area (in pixels) for detections to be saved (default: 0, no minimum)")
+    parser.add_argument("--max-area-px", type=int, default=0,
+                        help="Maximum area (in pixels) for detections to be saved (default: 0, no maximum)")
 
     args = parser.parse_args()
 
@@ -407,6 +417,8 @@ def main():
                     save_images,
                     args.save_labels,
                     True,
+                    args.min_area_px,
+                    args.max_area_px,
                 )
                 all_detections.extend(detections)
             except Exception as e:

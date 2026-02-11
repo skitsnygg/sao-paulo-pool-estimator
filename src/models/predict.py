@@ -41,7 +41,12 @@ def _list_sample_images(sample_dir: Path) -> list[Path]:
     return sorted(p for p in sample_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
 
 
-def _collect_predictions(model, sources, tile_id_by_path: dict[str, str], config: dict) -> tuple[list[dict], list[dict]]:
+def collect_predictions(
+    model,
+    sources,
+    tile_id_by_path: dict[str, str],
+    config: dict,
+) -> tuple[list[dict], list[dict]]:
     results_iter = model.predict(
         source=sources,
         conf=config["inference"].get("conf", 0.25),
@@ -74,6 +79,15 @@ def _collect_predictions(model, sources, tile_id_by_path: dict[str, str], config
             )
 
     return rows, detections
+
+
+def _collect_predictions(
+    model,
+    sources,
+    tile_id_by_path: dict[str, str],
+    config: dict,
+) -> tuple[list[dict], list[dict]]:
+    return collect_predictions(model, sources, tile_id_by_path, config)
 
 
 def _collect_label_fallback(sample_dir: Path, labels_dir: Path) -> tuple[list[dict], list[dict]]:
@@ -118,7 +132,7 @@ def _collect_label_fallback(sample_dir: Path, labels_dir: Path) -> tuple[list[di
     return rows, detections
 
 
-def _write_outputs(
+def write_outputs(
     root: Path,
     rows: list[dict],
     detections: list[dict],
@@ -164,6 +178,26 @@ def _write_outputs(
     return predictions_path
 
 
+def _write_outputs(
+    root: Path,
+    rows: list[dict],
+    detections: list[dict],
+    output_dir: Path | None = None,
+    predictions_path: Path | None = None,
+    demo_mode_used: bool = False,
+    demo_fallback_type: str = "none",
+) -> Path:
+    return write_outputs(
+        root,
+        rows,
+        detections,
+        output_dir=output_dir,
+        predictions_path=predictions_path,
+        demo_mode_used=demo_mode_used,
+        demo_fallback_type=demo_fallback_type,
+    )
+
+
 def run_inference(
     config_path: str,
     weights: str | None,
@@ -202,7 +236,7 @@ def run_inference(
 
     explicit_source = bool(source) or bool(tiles_csv)
     sources, tile_id_by_path = resolve_sources()
-    rows, detections = _collect_predictions(model, sources, tile_id_by_path, config)
+    rows, detections = collect_predictions(model, sources, tile_id_by_path, config)
     total_detections = sum(row["count"] for row in rows)
 
     fallback_triggered = False
@@ -220,7 +254,7 @@ def run_inference(
             "Demo mode: no pools detected in the provided tiles. "
             "Quickstart tiles may contain no pools, so rerunning on bundled Sao Paulo samples."
         )
-        fallback_rows, fallback_detections = _collect_predictions(model, str(sample_dir), {}, config)
+        fallback_rows, fallback_detections = collect_predictions(model, str(sample_dir), {}, config)
         fallback_type = "samples"
         total_fallback = sum(row["count"] for row in fallback_rows)
         if total_fallback == 0:
@@ -242,7 +276,7 @@ def run_inference(
         if explicit_source:
             source_output_dir = demo_output_dir / "source"
             source_predictions_path = source_output_dir / "predictions.csv"
-            _write_outputs(
+            write_outputs(
                 root,
                 rows,
                 detections,
@@ -251,7 +285,7 @@ def run_inference(
                 demo_mode_used=True,
                 demo_fallback_type="none",
             )
-        output_path = _write_outputs(
+        output_path = write_outputs(
             root,
             fallback_rows,
             fallback_detections,
@@ -264,7 +298,7 @@ def run_inference(
         summary_detections = fallback_detections
         summary_fallback = fallback_type
     else:
-        output_path = _write_outputs(
+        output_path = write_outputs(
             root,
             rows,
             detections,

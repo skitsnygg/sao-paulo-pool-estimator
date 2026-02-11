@@ -57,6 +57,21 @@ This project estimates the number of swimming pools in São Paulo, Brazil using 
   python -m src.models.predict --config configs/quickstart.yaml --source data/processed/yolo/images/test --demo-mode
   ```
 
+## Batch Inference for São Paulo Neighborhoods
+
+- Input should be a top-level directory with one subfolder per neighborhood.
+- Outputs are written under `data/processed/batch/<neighborhood_name>/`.
+
+- Basic run:
+  ```bash
+  python scripts/batch_inference.py --input-dir ~/Downloads/sao_paulo_tiles
+  ```
+
+- Run with area filtering:
+  ```bash
+  python scripts/batch_inference.py --input-dir ~/Downloads/sao_paulo_tiles --min-area-px 50 --max-area-px 50000
+  ```
+
 ## Outputs
 
 - `data/processed/predictions.csv` - Model predictions for each tile.

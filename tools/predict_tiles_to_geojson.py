@@ -70,8 +70,10 @@ def main():
             imgsz=args.imgsz,
             conf=args.conf,
             iou=args.iou,
+            retina_masks=True,
             verbose=False,
         )
+
         r = results[0]
         if r.masks is None or r.masks.xy is None:
             continue

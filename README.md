@@ -1,87 +1,93 @@
 # São Paulo Pool Estimator
 
-This project estimates the number of swimming pools in São Paulo, Brazil using computer vision and geospatial data.
+Estimate swimming pool polygons in São Paulo using tile-based YOLOv8 segmentation and GeoJSON post-processing.
 
-## System Overview
+## What's in this repo
+- **Segmentation models** (YOLOv8). The current production base model is:
+  `runs/segment/jardins_seg_v2_1024_s2/weights/best.pt`.
+- **Tile inference pipeline** to generate GeoJSON polygons from z18 tiles.
+- **Geometry pipeline** for dedupe + overlap audit to ensure clean, stable output.
 
-- YOLOv8 segmentation model trained on São Paulo imagery.
-- Pipeline steps:
-  - Download tiles from OpenStreetMap.
-  - Train the model on São Paulo pool data.
-  - Run inference on tiles.
-  - Estimate pool density across the AOI.
+## Production GeoJSON pipeline (z18 pools)
+The production path is:
+1) **Inference** -> 2) **Dedupe** -> 3) **Overlap audit**.
 
-## Current Status
+Full, copy/paste commands live in `docs/production_inference.md`.
 
-- Model runs and produces predictions.
-- Quickstart tiles are outside São Paulo.
-- Zero pools in quickstart is expected.
+### Quick commands (recall-first)
+```bash
+.venv/bin/python tools/predict_tiles_to_geojson.py \
+  --model runs/segment/jardins_seg_v2_1024_s2/weights/best.pt \
+  --tiles-dir data/raw/tiles/18 \
+  --z 18 \
+  --imgsz 1024 \
+  --conf 0.05 \
+  --iou 0.5 \
+  --min-area-px 30 \
+  --precision 7 \
+  --out-geojson runs/segment/predict_xyz_z18/pools_conf05_iou05_area30.geojson
 
-## Expected Behavior
+.venv/bin/python tools/dedupe_geojson_polygons.py \
+  --in-geojson runs/segment/predict_xyz_z18/pools_conf05_iou05_area30.geojson \
+  --out-geojson runs/segment/predict_xyz_z18/prod_dedup.geojson \
+  --iou 0.35 \
+  --precision 7 \
+  --stats
 
-- Trained model detects pools in São Paulo imagery.
-- Baseline method detects some pools.
-- Estimates are reasonable for the AOI.
+.venv/bin/python tools/audit_geojson_overlaps.py \
+  --in-geojson runs/segment/predict_xyz_z18/prod_dedup.geojson \
+  --iou 0.35 \
+  --top-k 10
+```
 
-## Running the Pipeline
+## Model status (important)
+- The pseudo-label fine-tune (`checkpoints/pools_best.pt`) **collapsed recall** on real tiles. Do **not** ship it.
+- Use the tile-strong base model at `runs/segment/jardins_seg_v2_1024_s2/weights/best.pt`.
 
-- Full pipeline:
-  ```bash
-  bash scripts/quickstart.sh
-  ```
-- Individual steps:
-  ```bash
-  # Download tiles
-  python -m src.pipeline --step download
+## Tile recall sanity harness
+Use `tools/ab_tile_eval.py` to compare models on pool-heavy tiles.
 
-  # Run inference
-  python -m src.pipeline --step predict
+```bash
+.venv/bin/python tools/ab_tile_eval.py \
+  --model runs/segment/jardins_seg_v2_1024_s2/weights/best.pt \
+  --tiles-dir /tmp/tiles18_poolheavy_200 \
+  --z 18 \
+  --imgsz 1024 \
+  --conf 0.05 \
+  --iou 0.5 \
+  --min-area-px 30 \
+  --out-geojson runs/segment/ab_eval/base_poolheavy.geojson
+```
 
-  # Run baseline
-  python -m src.models.baseline --config configs/quickstart.yaml --source data/processed/yolo/images --threshold 0.003
-  ```
+## Geometry tools
+- `tools/dedupe_geojson_polygons.py`: STRtree-based dedupe with robust geometry repair and stable output.
+- `tools/audit_geojson_overlaps.py`: audits remaining overlaps; exits nonzero if any IoU >= threshold.
 
-## Quickstart Inference Demo
+## Inference details
+- `tools/predict_tiles_to_geojson.py` reads tiles named `{x}_{y}.jpg` under `data/raw/tiles/18`.
+- **Area filtering is based on mask pixel area** (from `masks.data`) when available, falling back to polygon area.
+- Output polygons are rounded (`--precision`), CCW-oriented, and repaired if needed.
 
-- Quickstart tiles may contain no pools.
-- Demo mode reruns on bundled São Paulo samples if needed.
-- If the model still returns zero, demo mode falls back to labeled sample boxes.
+## Tests / CI
+- Unit tests live in `tests/`.
+- CI runs:
+  - `python -m py_compile tools/*.py tests/*.py`
+  - `python -m unittest discover -s tests -p "test_*.py" -v`
+  - dedupe + audit on a small fixture `tests/fixtures/overlap_fixture.geojson`
 
-- Normal run (may yield 0 pools):
-  ```bash
-  python -m src.models.predict --config configs/quickstart.yaml --source data/processed/yolo/images/test
-  ```
+## Legacy quickstart (older pipeline)
+```bash
+bash scripts/quickstart.sh
+```
+Note: quickstart tiles are outside São Paulo; zero pools can be expected.
 
-- Demo run (forces a positive example if needed):
-  ```bash
-  python -m src.models.predict --config configs/quickstart.yaml --source data/processed/yolo/images/test --demo-mode
-  ```
+## Outputs (legacy pipeline)
+- `data/processed/predictions.csv` - Model predictions per tile
+- `reports/logs/estimate.json` - Final estimate for São Paulo
+- `reports/figures/quickstart_pool_density.html` - Pool density map
 
-## Batch Inference for São Paulo Neighborhoods
+## Dependencies
+- Python 3.10+ recommended
+- `ultralytics`, `shapely`, `Pillow`
 
-- Input should be a top-level directory with one subfolder per neighborhood.
-- Outputs are written under `data/processed/batch/<neighborhood_name>/`.
-
-- Basic run:
-  ```bash
-  python scripts/batch_inference.py --input-dir ~/Downloads/sao_paulo_tiles
-  ```
-
-- Run with area filtering:
-  ```bash
-  python scripts/batch_inference.py --input-dir ~/Downloads/sao_paulo_tiles --min-area-px 50 --max-area-px 50000
-  ```
-
-## Outputs
-
-- `data/processed/predictions.csv` - Model predictions for each tile.
-- `data/processed/predictions/pool_counts.csv` - Pool counts per tile.
-- `data/processed/predictions/detections.csv` - Pool detections per tile.
-- `data/processed/predictions_baseline.csv` - Baseline predictions for each tile.
-- `reports/logs/estimate.json` - Final pool estimate for São Paulo.
-- `reports/figures/quickstart_pool_density.html` - Interactive map of pool density.
-
-## Notes
-
-- Quickstart uses a small non-São Paulo sample.
-- Use the full São Paulo dataset for real detection results.
+See `requirements.txt` for the full set.

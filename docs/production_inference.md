@@ -69,3 +69,37 @@ Use the evaluation harness to compare the tile-strong base model vs the collapse
 ```
 
 If the audit exits with code 0, the output is ready to ship.
+
+## Esri World Imagery pipeline (EPSG:3857 GeoTIFFs)
+This pipeline downloads Esri XYZ tiles as georeferenced GeoTIFFs in EPSG:3857, runs inference, and writes both EPSG:3857 and EPSG:31983 GeoJSON outputs.
+
+1) **Download Esri World Imagery tiles**
+```bash
+.venv/bin/python tools/download_esri_world_imagery.py \
+  --aoi-geojson data/external/aoi_vila_mariana.geojson \
+  --zoom 19 \
+  --out-dir data/raw/esri_world_imagery/vila_mariana_z19
+```
+
+2) **Georef sanity check (QGIS project + bounds)**
+```bash
+.venv/bin/python tools/qgis_georef_check.py \
+  --tiles-dir data/raw/esri_world_imagery/vila_mariana_z19 \
+  --qgs-out /tmp/esri_georef_check.qgs
+```
+
+3) **Inference (writes EPSG:3857 + EPSG:31983)**
+```bash
+.venv/bin/python tools/predict_tiles_to_geojson.py \
+  --model runs/segment/jardins_seg_v2_1024_s2/weights/best.pt \
+  --tiles-dir data/raw/esri_world_imagery/vila_mariana_z19/z19 \
+  --imgsz 1024 \
+  --conf 0.35 \
+  --iou 0.7 \
+  --min-area-m2 6.0 \
+  --out-geojson runs/segment/esri_vila_mariana_z19/pools_31983.geojson
+```
+
+Notes:
+- `tools/predict_tiles_to_geojson.py` also writes a `*_3857.geojson` alongside the final EPSG:31983 output for QGIS alignment checks.
+- If you run on non-GeoTIFF XYZ tiles, `--z` is required. For GeoTIFFs with embedded CRS, `--z` is optional.

@@ -5,11 +5,13 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ultralytics import YOLO
 
 from shapely.geometry import Polygon
+from pyproj import CRS, Transformer
+import numpy as np
 
 try:  # Shapely 2.x
     from shapely.validation import make_valid  # type: ignore
@@ -26,6 +28,7 @@ class InferenceStats:
     polys_scaled_from_norm: int = 0
     polys_dropped_mask_area: int = 0
     polys_dropped_poly_area: int = 0
+    polys_dropped_area_m2: int = 0
 
 
 def mercator_lat_from_t(t: float) -> float:
@@ -52,6 +55,104 @@ def parse_xy_from_path(p: Path) -> Tuple[int, int]:
     stem = p.stem
     a, b = stem.split("_", 1)
     return int(a), int(b)
+
+
+GeoTransform = Tuple[float, float, float, float, float, float]
+
+
+def is_geotiff(p: Path) -> bool:
+    return p.suffix.lower() in {".tif", ".tiff"}
+
+
+def normalize_crs(crs: Optional[str]) -> Optional[str]:
+    if not crs:
+        return None
+    try:
+        return CRS.from_user_input(crs).to_string()
+    except Exception:
+        return crs
+
+
+def read_geotiff_image(p: Path) -> Tuple[np.ndarray, GeoTransform, str]:
+    try:
+        import rasterio
+    except Exception:
+        rasterio = None
+
+    if rasterio is not None:
+        with rasterio.open(p) as src:
+            arr = src.read()
+            if arr.ndim == 2:
+                arr = arr[:, :, None]
+            else:
+                arr = np.transpose(arr, (1, 2, 0))
+            if arr.shape[2] == 1:
+                arr = np.repeat(arr, 3, axis=2)
+            elif arr.shape[2] > 3:
+                arr = arr[:, :, :3]
+            if arr.dtype != np.uint8:
+                arr = arr.astype(np.uint8)
+            transform = src.transform.to_gdal()
+            crs = normalize_crs(src.crs.to_string() if src.crs else None)
+            if not crs:
+                raise RuntimeError("GeoTIFF missing CRS")
+            return arr, transform, crs
+
+    try:
+        from osgeo import gdal, osr
+    except Exception as exc:
+        raise RuntimeError("rasterio or GDAL Python bindings are required to read GeoTIFFs") from exc
+
+    ds = gdal.Open(str(p), gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError(f"Could not open GeoTIFF: {p}")
+    transform = ds.GetGeoTransform()
+    proj = ds.GetProjection()
+    if not transform or not proj:
+        raise RuntimeError("GeoTIFF missing geotransform/CRS")
+    try:
+        crs = CRS.from_wkt(proj).to_string()
+    except Exception:
+        crs = proj
+
+    arr = ds.ReadAsArray()
+    if arr is None:
+        raise RuntimeError(f"Empty GeoTIFF: {p}")
+    if arr.ndim == 2:
+        arr = arr[:, :, None]
+    else:
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.shape[2] == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    elif arr.shape[2] > 3:
+        arr = arr[:, :, :3]
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)
+    return arr, transform, normalize_crs(crs) or crs
+
+
+def pixel_to_projected(transform: GeoTransform, px: float, py: float) -> Tuple[float, float]:
+    origin_x, pixel_w, rot_x, origin_y, rot_y, pixel_h = transform
+    geo_x = origin_x + px * pixel_w + py * rot_x
+    geo_y = origin_y + px * rot_y + py * pixel_h
+    return geo_x, geo_y
+
+
+_TRANSFORMERS: Dict[Tuple[str, str], Transformer] = {}
+
+
+def get_transformer(src_crs: str, dst_crs: str) -> Transformer:
+    key = (src_crs, dst_crs)
+    if key not in _TRANSFORMERS:
+        _TRANSFORMERS[key] = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    return _TRANSFORMERS[key]
+
+
+def transform_ring(ring: List[List[float]], src_crs: str, dst_crs: str) -> List[List[float]]:
+    if src_crs == dst_crs:
+        return ring
+    transformer = get_transformer(src_crs, dst_crs)
+    return [[float(x), float(y)] for x, y in transformer.itransform(ring)]
 
 
 def poly_area_px(poly_xy: List[Tuple[float, float]]) -> float:
@@ -172,7 +273,7 @@ def scale_norm_to_px(poly_xy: List[Tuple[float, float]], w: int, h: int) -> List
 
 
 def iter_images(d: Path) -> List[Path]:
-    exts = (".jpg", ".jpeg", ".png", ".webp")
+    exts = (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")
     out = []
     for e in exts:
         out.extend(d.glob(f"*{e}"))
@@ -212,51 +313,90 @@ def run_inference(
     *,
     model_path: Path,
     tiles: Sequence[Path],
-    z: int,
+    z: Optional[int],
     imgsz: int,
     conf: float,
     iou: float,
     min_area_px: float,
+    min_mask_area_px: float,
+    min_area_m2: float,
     max_det: int,
     retina_masks: bool,
     device: Optional[str],
     verbose: bool,
     precision: int,
-) -> Tuple[List[Dict[str, Any]], InferenceStats]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], InferenceStats]:
     from PIL import Image
 
     model = YOLO(str(model_path))
 
-    features: List[Dict[str, Any]] = []
+    features_3857: List[Dict[str, Any]] = []
+    features_31983: List[Dict[str, Any]] = []
     stats = InferenceStats()
 
     for p in tiles:
         stats.tiles_processed += 1
 
-        try:
-            x, y = parse_xy_from_path(p)
-        except Exception as e:
-            if verbose:
-                print(f"[skip] {p.name}: cannot parse x_y ({e})")
-            continue
+        use_geotiff = is_geotiff(p)
+        img = None
+        src_crs: Optional[str] = None
+        transform: Optional[GeoTransform] = None
+        x: Optional[int] = None
+        y: Optional[int] = None
 
-        try:
-            w, h = Image.open(p).size
-        except Exception as e:
-            if verbose:
-                print(f"[skip] {p.name}: cannot open image ({e})")
-            continue
+        if use_geotiff:
+            try:
+                img, transform, src_crs = read_geotiff_image(p)
+            except Exception as e:
+                if verbose:
+                    print(f"[skip] {p.name}: cannot read GeoTIFF ({e})")
+                continue
+            h, w = img.shape[:2]
+            try:
+                x, y = parse_xy_from_path(p)
+            except Exception:
+                x, y = None, None
+        else:
+            try:
+                x, y = parse_xy_from_path(p)
+            except Exception as e:
+                if verbose:
+                    print(f"[skip] {p.name}: cannot parse x_y ({e})")
+                continue
 
-        results = model.predict(
-            source=str(p),
-            imgsz=imgsz,
-            conf=conf,
-            iou=iou,
-            max_det=max_det,
-            retina_masks=bool(retina_masks),
-            device=device,
-            verbose=False,
-        )
+            try:
+                w, h = Image.open(p).size
+            except Exception as e:
+                if verbose:
+                    print(f"[skip] {p.name}: cannot open image ({e})")
+                continue
+
+        if use_geotiff:
+            results = model.predict(
+                source=img,
+                imgsz=imgsz,
+                conf=conf,
+                iou=iou,
+                max_det=max_det,
+                retina_masks=bool(retina_masks),
+                device=device,
+                verbose=False,
+            )
+        else:
+            if z is None:
+                if verbose:
+                    print(f"[skip] {p.name}: missing --z for XYZ tiles")
+                continue
+            results = model.predict(
+                source=str(p),
+                imgsz=imgsz,
+                conf=conf,
+                iou=iou,
+                max_det=max_det,
+                retina_masks=bool(retina_masks),
+                device=device,
+                verbose=False,
+            )
 
         r = results[0]
         if r.masks is None or r.masks.xy is None:
@@ -264,6 +404,12 @@ def run_inference(
 
         stats.tiles_with_masks += 1
         mask_areas = _mask_areas_from_masks(r.masks)
+        confs: List[float] = []
+        try:
+            if r.boxes is not None and getattr(r.boxes, "conf", None) is not None:
+                confs = [float(v) for v in r.boxes.conf.tolist()]
+        except Exception:
+            confs = []
 
         for idx, poly in enumerate(r.masks.xy):
             poly_xy = [(float(px), float(py)) for px, py in poly]
@@ -278,7 +424,7 @@ def run_inference(
                 mask_area_px = mask_areas[idx]
 
             if mask_area_px is not None:
-                if mask_area_px < min_area_px:
+                if mask_area_px < min_mask_area_px:
                     stats.polys_dropped_mask_area += 1
                     continue
             else:
@@ -286,55 +432,104 @@ def run_inference(
                     stats.polys_dropped_poly_area += 1
                     continue
 
-            stats.polys_kept += 1
+            src_ring: List[List[float]] = []
+            if use_geotiff:
+                if transform is None or src_crs is None:
+                    if verbose:
+                        print(f"[skip] {p.name}: missing geotransform/CRS")
+                    continue
+                for px, py in poly_xy:
+                    X, Y = pixel_to_projected(transform, px, py)
+                    src_ring.append([float(X), float(Y)])
+                src_crs_eff = src_crs
+            else:
+                if z is None or x is None or y is None:
+                    if verbose:
+                        print(f"[skip] {p.name}: missing z/x/y for XYZ conversion")
+                    continue
+                for px, py in poly_xy:
+                    lon, lat = lonlat_from_xyz_pixel(z, x, y, px, py, w, h)
+                    src_ring.append([float(lon), float(lat)])
+                src_crs_eff = "EPSG:4326"
 
-            ring_ll: List[List[float]] = []
-            for px, py in poly_xy:
-                lon, lat = lonlat_from_xyz_pixel(z, x, y, px, py, w, h)
-                ring_ll.append([lon, lat])
-
-            ring_ll = _normalize_ring(ring_ll, precision)
-            if len(ring_ll) < 4:
+            ring_3857 = transform_ring(src_ring, src_crs_eff, "EPSG:3857")
+            ring_3857 = _normalize_ring(ring_3857, precision)
+            if len(ring_3857) < 4:
                 if verbose:
-                    print(f"[skip] {p.name}: invalid ring after normalization")
+                    print(f"[skip] {p.name}: invalid ring in EPSG:3857")
                 continue
 
-            features.append(
+            ring_31983 = transform_ring(ring_3857, "EPSG:3857", "EPSG:31983")
+            ring_31983 = _normalize_ring(ring_31983, precision)
+            if len(ring_31983) < 4:
+                if verbose:
+                    print(f"[skip] {p.name}: invalid ring in EPSG:31983")
+                continue
+
+            poly_31983 = Polygon(ring_31983)
+            if poly_31983.is_empty or (not poly_31983.is_valid) or poly_31983.area == 0.0:
+                stats.polys_dropped_area_m2 += 1
+                continue
+
+            area_m2 = float(poly_31983.area)
+            if min_area_m2 > 0.0 and area_m2 < min_area_m2:
+                stats.polys_dropped_area_m2 += 1
+                continue
+
+            stats.polys_kept += 1
+            confidence = confs[idx] if idx < len(confs) else float(conf)
+
+            props = {
+                "tile": p.name,
+                "z": z,
+                "x": x,
+                "y": y,
+                "mask_idx": idx,
+                "mask_area_px": mask_area_px,
+                "area_m2": area_m2,
+                "confidence": confidence,
+            }
+
+            features_3857.append(
                 {
                     "type": "Feature",
-                    "properties": {
-                        "tile": p.name,
-                        "z": z,
-                        "x": x,
-                        "y": y,
-                        "mask_area_px": mask_area_px,
-                    },
-                    "geometry": {"type": "Polygon", "coordinates": [ring_ll]},
+                    "properties": props,
+                    "geometry": {"type": "Polygon", "coordinates": [ring_3857]},
+                }
+            )
+            features_31983.append(
+                {
+                    "type": "Feature",
+                    "properties": props,
+                    "geometry": {"type": "Polygon", "coordinates": [ring_31983]},
                 }
             )
 
         if verbose and stats.tiles_processed % 50 == 0:
             print(
-                f"[progress] tiles={stats.tiles_processed} features={len(features)} "
+                f"[progress] tiles={stats.tiles_processed} features={len(features_3857)} "
                 f"tiles_with_masks={stats.tiles_with_masks}"
             )
 
-    return features, stats
+    return features_3857, features_31983, stats
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, type=Path)
     ap.add_argument("--tiles-dir", required=True, type=Path)
-    ap.add_argument("--z", required=True, type=int)
     ap.add_argument("--out-geojson", required=True, type=Path)
+    ap.add_argument("--out-geojson-3857", type=Path, default=None)
 
     ap.add_argument("--imgsz", type=int, default=1024)
-    ap.add_argument("--conf", type=float, default=0.05)
+    ap.add_argument("--conf", type=float, default=0.35)
     ap.add_argument("--iou", type=float, default=0.7)
     ap.add_argument("--min-area-px", type=float, default=120.0)
+    ap.add_argument("--min-mask-area-px", type=float, default=120.0)
+    ap.add_argument("--min-area-m2", type=float, default=6.0, help="Drop polygons smaller than this area in EPSG:31983")
     ap.add_argument("--max-tiles", type=int, default=0, help="0 = all tiles, else limit for testing")
     ap.add_argument("--precision", type=int, default=7, help="decimal places for output coordinate rounding")
+    ap.add_argument("--z", type=int, default=None, help="XYZ zoom (required for non-GeoTIFF tiles)")
 
     # Inference knobs
     ap.add_argument(
@@ -357,7 +552,18 @@ def main() -> None:
     if args.max_tiles and args.max_tiles > 0:
         tiles = tiles[: args.max_tiles]
 
-    features, stats = run_inference(
+    needs_z = any(not is_geotiff(p) for p in tiles)
+    if needs_z and args.z is None:
+        raise SystemExit("--z is required when using non-GeoTIFF XYZ tiles")
+
+    out_geojson_3857 = args.out_geojson_3857
+    if out_geojson_3857 is None:
+        if args.out_geojson.suffix.lower() == ".geojson":
+            out_geojson_3857 = args.out_geojson.with_name(args.out_geojson.stem + "_3857.geojson")
+        else:
+            out_geojson_3857 = args.out_geojson.with_name(args.out_geojson.name + "_3857.geojson")
+
+    features_3857, features_31983, stats = run_inference(
         model_path=args.model,
         tiles=tiles,
         z=args.z,
@@ -365,6 +571,8 @@ def main() -> None:
         conf=args.conf,
         iou=args.iou,
         min_area_px=args.min_area_px,
+        min_mask_area_px=args.min_mask_area_px,
+        min_area_m2=args.min_area_m2,
         max_det=args.max_det,
         retina_masks=bool(args.retina_masks),
         device=args.device,
@@ -372,22 +580,44 @@ def main() -> None:
         precision=args.precision,
     )
 
-    out = {"type": "FeatureCollection", "features": features}
+    def _sort_key(feat: Dict[str, Any]) -> Tuple[str, int]:
+        props = feat.get("properties", {})
+        tile = props.get("tile") or ""
+        idx = props.get("mask_idx")
+        try:
+            idx_val = int(idx)
+        except Exception:
+            idx_val = 0
+        return (tile, idx_val)
+
+    features_3857 = sorted(features_3857, key=_sort_key)
+    features_31983 = sorted(features_31983, key=_sort_key)
+
+    out_3857 = {"type": "FeatureCollection", "features": features_3857, "crs": {"type": "name", "properties": {"name": "EPSG:3857"}}}
+    out_31983 = {"type": "FeatureCollection", "features": features_31983, "crs": {"type": "name", "properties": {"name": "EPSG:31983"}}}
+
+    out_geojson_3857.parent.mkdir(parents=True, exist_ok=True)
+    out_geojson_3857.write_text(
+        json.dumps(out_3857, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8"
+    )
     args.out_geojson.parent.mkdir(parents=True, exist_ok=True)
     args.out_geojson.write_text(
-        json.dumps(out, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8"
+        json.dumps(out_31983, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8"
     )
 
+    print("Wrote:", out_geojson_3857)
     print("Wrote:", args.out_geojson)
     print("Tiles processed:", stats.tiles_processed)
     print("Tiles with masks:", stats.tiles_with_masks)
     print("Polys total:", stats.polys_total)
     print("Polys scaled_from_norm:", stats.polys_scaled_from_norm)
-    print("Polys dropped_area:", stats.polys_dropped_mask_area + stats.polys_dropped_poly_area)
+    print("Polys dropped_area_px:", stats.polys_dropped_mask_area + stats.polys_dropped_poly_area)
+    print("Polys dropped_area_m2:", stats.polys_dropped_area_m2)
     print("Polys dropped_mask_area:", stats.polys_dropped_mask_area)
     print("Polys dropped_poly_area:", stats.polys_dropped_poly_area)
     print("Polys kept:", stats.polys_kept)
-    print("Features:", len(features))
+    print("Features (3857):", len(features_3857))
+    print("Features (31983):", len(features_31983))
 
 
 if __name__ == "__main__":

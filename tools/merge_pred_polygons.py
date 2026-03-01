@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from PIL import Image
+from shapely.affinity import affine_transform
 from shapely.geometry import Polygon, mapping
 from shapely.ops import unary_union
 
@@ -73,15 +74,14 @@ def worldfile_for_image(img: Path) -> Optional[Path]:
 @dataclass
 class Det:
     poly_px: Polygon
-    conf: float
+    conf: Optional[float]
 
 
-def parse_ultralytics_seg_line(line: str, w: int, h: int) -> Optional[Tuple[int, float, Polygon]]:
+def parse_ultralytics_seg_line(line: str, w: int, h: int) -> Optional[Tuple[int, Optional[float], Polygon]]:
     """
     Accepts both:
       - cls x1 y1 x2 y2 ... (normalized)
-      - cls conf x1 y1 x2 y2 ... (normalized; custom)
-    Detect conf by: after cls, if numeric count is odd, treat first as conf.
+      - cls x1 y1 x2 y2 ... conf (normalized; Ultralytics save_conf)
     """
     parts = line.strip().split()
     if len(parts) < 3:
@@ -97,10 +97,11 @@ def parse_ultralytics_seg_line(line: str, w: int, h: int) -> Optional[Tuple[int,
     except Exception:
         return None
 
-    conf = 1.0
+    conf: Optional[float] = None
     if len(nums) % 2 == 1:
-        conf = float(nums[0])
-        nums = nums[1:]
+        # Ultralytics save_conf: conf at end of line
+        conf = float(nums[-1])
+        nums = nums[:-1]
 
     if len(nums) < 6 or (len(nums) % 2 != 0):
         return None
@@ -164,7 +165,8 @@ def merge_by_iou(dets: List[Det], iou_thresh: float) -> List[Det]:
                     changed = True
 
         polys = [dets[k].poly_px for k in cluster]
-        conf = max(dets[k].conf for k in cluster)
+        confs = [dets[k].conf for k in cluster if dets[k].conf is not None]
+        conf = max(confs) if confs else None
         u = unary_union(polys)
 
         if u.is_empty:
@@ -181,6 +183,33 @@ def merge_by_iou(dets: List[Det], iou_thresh: float) -> List[Det]:
             continue
 
     return merged
+
+
+def nms_by_iou(dets: List[Det], iou_thresh: float) -> List[Det]:
+    """
+    Greedy NMS in pixel space:
+      - sort by confidence (None treated as 0)
+      - suppress polygons with IoU >= threshold
+    """
+    if not dets:
+        return []
+
+    def _score(d: Det) -> float:
+        return float(d.conf) if d.conf is not None else 0.0
+
+    remaining = sorted(enumerate(dets), key=lambda t: (-_score(t[1]), t[0]))
+    kept: List[Det] = []
+
+    while remaining:
+        _, current = remaining.pop(0)
+        kept.append(current)
+        filtered: List[Tuple[int, Det]] = []
+        for idx, det in remaining:
+            if poly_iou(current.poly_px, det.poly_px) < iou_thresh:
+                filtered.append((idx, det))
+        remaining = filtered
+
+    return kept
 
 
 # -----------------------------
@@ -215,12 +244,64 @@ def find_image(images_dir: Path, stem: str) -> Optional[Path]:
 # -----------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Merge YOLOv8-seg prediction labels into world-coordinate polygons.",
+        epilog=(
+            "Examples:\n"
+            "  # baseline merge\n"
+            "  python tools/merge_pred_polygons.py \\\n"
+            "    --pred-dir runs/segment/<run> \\\n"
+            "    --images-dir data/raw/geosampa_ortho/sp_city_2020/cell_0026_0007 \\\n"
+            "    --out-geojson runs/segment/<run>/merged.geojson\n"
+            "\n"
+            "  # min confidence\n"
+            "  python tools/merge_pred_polygons.py \\\n"
+            "    --pred-dir runs/segment/<run> \\\n"
+            "    --images-dir data/raw/geosampa_ortho/sp_city_2020/cell_0026_0007 \\\n"
+            "    --out-geojson runs/segment/<run>/merged_conf25.geojson \\\n"
+            "    --min-conf 0.25\n"
+            "\n"
+            "  # clip edge artifacts\n"
+            "  python tools/merge_pred_polygons.py \\\n"
+            "    --pred-dir runs/segment/<run> \\\n"
+            "    --images-dir data/raw/geosampa_ortho/sp_city_2020/cell_0026_0007 \\\n"
+            "    --out-geojson runs/segment/<run>/merged_clip3.geojson \\\n"
+            "    --clip-edge-px 3\n"
+            "\n"
+            "  # min conf + clip edge\n"
+            "  python tools/merge_pred_polygons.py \\\n"
+            "    --pred-dir runs/segment/<run> \\\n"
+            "    --images-dir data/raw/geosampa_ortho/sp_city_2020/cell_0026_0007 \\\n"
+            "    --out-geojson runs/segment/<run>/merged_conf25_clip3.geojson \\\n"
+            "    --min-conf 0.25 --clip-edge-px 3\n"
+            "\n"
+            "  # prefer NMS over union merge\n"
+            "  python tools/merge_pred_polygons.py \\\n"
+            "    --pred-dir runs/segment/<run> \\\n"
+            "    --images-dir data/raw/geosampa_ortho/sp_city_2020/cell_0026_0007 \\\n"
+            "    --out-geojson runs/segment/<run>/merged_nms.geojson \\\n"
+            "    --prefer-nms\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("--pred-dir", required=True)
     ap.add_argument("--images-dir", required=True)
     ap.add_argument("--out-geojson", required=True)
     ap.add_argument("--iou", type=float, default=0.35)
     ap.add_argument("--min-area-px", type=float, default=0.0)
+    ap.add_argument("--min-conf", type=float, default=None, help="Drop detections with conf < min_conf (if conf present)")
+    ap.add_argument(
+        "--clip-edge-px",
+        type=int,
+        default=0,
+        help="Drop detections touching within this many pixels of any image border (default: 0)",
+    )
+    ap.add_argument(
+        "--prefer-nms",
+        action="store_true",
+        default=False,
+        help="Use NMS instead of polygon union when IoU >= threshold",
+    )
     args = ap.parse_args()
 
     pred_dir = Path(args.pred_dir)
@@ -260,21 +341,29 @@ def main() -> None:
                 continue
             cls, conf, poly_px = parsed
 
+            if args.min_conf is not None and conf is not None and conf < args.min_conf:
+                continue
+
             # Filter in pixel space
             if poly_px.area < args.min_area_px:
                 continue
+
+            if args.clip_edge_px > 0:
+                k = args.clip_edge_px
+                minx, miny, maxx, maxy = poly_px.bounds
+                if minx <= k or miny <= k or maxx >= (w - 1 - k) or maxy >= (h - 1 - k):
+                    continue
 
             dets.append(Det(poly_px, conf))
 
         if not dets:
             continue
 
-        dets_merged = merge_by_iou(dets, args.iou)
+        dets_merged = nms_by_iou(dets, args.iou) if args.prefer_nms else merge_by_iou(dets, args.iou)
 
         # Convert each merged polygon from pixel coords -> world coords and emit a feature
         for d in dets_merged:
-            pts_world = [wf.px_to_world(x, y) for (x, y) in d.poly_px.exterior.coords]
-            poly_world = Polygon(pts_world)
+            poly_world = affine_transform(d.poly_px, [wf.A, wf.B, wf.D, wf.E, wf.C, wf.F])
 
             if poly_world.is_empty or poly_world.area == 0:
                 continue
@@ -293,7 +382,7 @@ def main() -> None:
                                     "geometry": mapping(g),
                                     "properties": {
                                         "stem": stem,
-                                        "conf": float(d.conf),
+                                        "conf": float(d.conf) if d.conf is not None else None,
                                         "img": str(img),
                                         "worldfile": str(wf_path),
                                     },
@@ -307,7 +396,7 @@ def main() -> None:
                     "geometry": mapping(poly_world),
                     "properties": {
                         "stem": stem,
-                        "conf": float(d.conf),
+                        "conf": float(d.conf) if d.conf is not None else None,
                         "img": str(img),
                         "worldfile": str(wf_path),
                     },

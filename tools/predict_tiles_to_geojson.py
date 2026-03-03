@@ -7,11 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ultralytics import YOLO
-
-from shapely.geometry import Polygon
-from pyproj import CRS, Transformer
 import numpy as np
+from pyproj import CRS, Transformer
+from shapely.geometry import Polygon
+from ultralytics import YOLO
 
 try:  # Shapely 2.x
     from shapely.validation import make_valid  # type: ignore
@@ -272,13 +271,53 @@ def scale_norm_to_px(poly_xy: List[Tuple[float, float]], w: int, h: int) -> List
     return [(float(x) * w, float(y) * h) for x, y in poly_xy]
 
 
-def iter_images(d: Path) -> List[Path]:
+def iter_images(d: Path, recursive: bool = True) -> List[Path]:
     exts = (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")
-    out = []
-    for e in exts:
-        out.extend(d.glob(f"*{e}"))
-        out.extend(d.glob(f"*{e.upper()}"))
-    return sorted([p for p in out if p.is_file()])
+    if d.is_file():
+        return [d] if d.suffix.lower() in exts else []
+    out: List[Path] = []
+    if recursive:
+        for p in d.rglob("*"):
+            if p.is_file() and p.suffix.lower() in exts:
+                out.append(p)
+    else:
+        for p in d.glob("*"):
+            if p.is_file() and p.suffix.lower() in exts:
+                out.append(p)
+    return sorted(out)
+
+
+def find_worldfile(img: Path) -> Optional[Path]:
+    suffix = img.suffix.lower()
+    candidates: List[Path] = []
+    if suffix == ".png":
+        candidates.extend([
+            img.with_suffix(".pgw"),
+            img.with_suffix(".wld"),
+            img.with_suffix(".pngw"),
+        ])
+    elif suffix in (".jpg", ".jpeg"):
+        candidates.extend([
+            img.with_suffix(".jgw"),
+            img.with_suffix(".wld"),
+            img.with_suffix(".jpgw"),
+        ])
+    else:
+        candidates.extend([
+            img.with_suffix(".wld"),
+        ])
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def read_worldfile(p: Path) -> GeoTransform:
+    vals = [float(x.strip()) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
+    if len(vals) != 6:
+        raise ValueError(f"Worldfile must have 6 lines, got {len(vals)}: {p}")
+    A, D, B, E, C, F = vals
+    return (C, A, B, F, D, E)
 
 
 def _mask_areas_from_masks(masks: Any) -> Optional[List[float]]:
@@ -325,6 +364,7 @@ def run_inference(
     device: Optional[str],
     verbose: bool,
     precision: int,
+    worldfile_crs: str,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], InferenceStats]:
     from PIL import Image
 
@@ -338,6 +378,8 @@ def run_inference(
         stats.tiles_processed += 1
 
         use_geotiff = is_geotiff(p)
+        worldfile = None if use_geotiff else find_worldfile(p)
+        use_worldfile = worldfile is not None
         img = None
         src_crs: Optional[str] = None
         transform: Optional[GeoTransform] = None
@@ -358,18 +400,27 @@ def run_inference(
                 x, y = None, None
         else:
             try:
-                x, y = parse_xy_from_path(p)
-            except Exception as e:
-                if verbose:
-                    print(f"[skip] {p.name}: cannot parse x_y ({e})")
-                continue
-
-            try:
                 w, h = Image.open(p).size
             except Exception as e:
                 if verbose:
                     print(f"[skip] {p.name}: cannot open image ({e})")
                 continue
+
+            if use_worldfile:
+                try:
+                    transform = read_worldfile(worldfile)
+                    src_crs = normalize_crs(worldfile_crs) or worldfile_crs
+                except Exception as e:
+                    if verbose:
+                        print(f"[skip] {p.name}: cannot read worldfile ({e})")
+                    continue
+            else:
+                try:
+                    x, y = parse_xy_from_path(p)
+                except Exception as e:
+                    if verbose:
+                        print(f"[skip] {p.name}: cannot parse x_y ({e})")
+                    continue
 
         if use_geotiff:
             results = model.predict(
@@ -383,7 +434,7 @@ def run_inference(
                 verbose=False,
             )
         else:
-            if z is None:
+            if not use_worldfile and z is None:
                 if verbose:
                     print(f"[skip] {p.name}: missing --z for XYZ tiles")
                 continue
@@ -442,6 +493,17 @@ def run_inference(
                     X, Y = pixel_to_projected(transform, px, py)
                     src_ring.append([float(X), float(Y)])
                 src_crs_eff = src_crs
+            elif use_worldfile:
+                if transform is None or src_crs is None:
+                    if verbose:
+                        print(f"[skip] {p.name}: missing worldfile transform/CRS")
+                    continue
+                for px, py in poly_xy:
+                    X, Y = pixel_to_projected(transform, px, py)
+                    src_ring.append([float(X), float(Y)])
+                # Convert to EPSG:4326 first as requested
+                src_ring = transform_ring(src_ring, src_crs, "EPSG:4326")
+                src_crs_eff = "EPSG:4326"
             else:
                 if z is None or x is None or y is None:
                     if verbose:
@@ -530,6 +592,8 @@ def main() -> None:
     ap.add_argument("--max-tiles", type=int, default=0, help="0 = all tiles, else limit for testing")
     ap.add_argument("--precision", type=int, default=7, help="decimal places for output coordinate rounding")
     ap.add_argument("--z", type=int, default=None, help="XYZ zoom (required for non-GeoTIFF tiles)")
+    ap.add_argument("--worldfile-crs", type=str, default="EPSG:31983")
+    ap.add_argument("--no-recursive", action="store_true", default=False)
 
     # Inference knobs
     ap.add_argument(
@@ -545,15 +609,34 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    tiles = iter_images(args.tiles_dir)
+    tiles = iter_images(args.tiles_dir, recursive=not args.no_recursive)
     if not tiles:
         raise SystemExit(f"No images found in {args.tiles_dir}")
 
     if args.max_tiles and args.max_tiles > 0:
         tiles = tiles[: args.max_tiles]
 
-    needs_z = any(not is_geotiff(p) for p in tiles)
-    if needs_z and args.z is None:
+    images_found_total = len(tiles)
+    images_with_worldfile = 0
+    images_geotiff = 0
+    images_xyz = 0
+
+    for p in tiles:
+        if is_geotiff(p):
+            images_geotiff += 1
+            continue
+        wf = find_worldfile(p)
+        if wf is not None:
+            images_with_worldfile += 1
+        else:
+            images_xyz += 1
+
+    print("images_found_total:", images_found_total)
+    print("images_with_worldfile:", images_with_worldfile)
+    print("images_geotiff:", images_geotiff)
+    print("images_xyz:", images_xyz)
+
+    if images_xyz > 0 and args.z is None:
         raise SystemExit("--z is required when using non-GeoTIFF XYZ tiles")
 
     out_geojson_3857 = args.out_geojson_3857
@@ -578,6 +661,7 @@ def main() -> None:
         device=args.device,
         verbose=args.verbose,
         precision=args.precision,
+        worldfile_crs=args.worldfile_crs,
     )
 
     def _sort_key(feat: Dict[str, Any]) -> Tuple[str, int]:
@@ -593,8 +677,16 @@ def main() -> None:
     features_3857 = sorted(features_3857, key=_sort_key)
     features_31983 = sorted(features_31983, key=_sort_key)
 
-    out_3857 = {"type": "FeatureCollection", "features": features_3857, "crs": {"type": "name", "properties": {"name": "EPSG:3857"}}}
-    out_31983 = {"type": "FeatureCollection", "features": features_31983, "crs": {"type": "name", "properties": {"name": "EPSG:31983"}}}
+    out_3857 = {
+        "type": "FeatureCollection",
+        "features": features_3857,
+        "crs": {"type": "name", "properties": {"name": "EPSG:3857"}},
+    }
+    out_31983 = {
+        "type": "FeatureCollection",
+        "features": features_31983,
+        "crs": {"type": "name", "properties": {"name": "EPSG:31983"}},
+    }
 
     out_geojson_3857.parent.mkdir(parents=True, exist_ok=True)
     out_geojson_3857.write_text(

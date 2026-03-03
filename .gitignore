@@ -8,6 +8,34 @@ __pycache__/
 dist/
 build/
 
+# Folium outputs
+runs/folium/
+
+# Raster scratch
+*.tif
+*.tiff
+*.vrt
+*.ovr
+*.aux.xml
+*.png
+
+# Large city mosaics
+sp_2020_*
+cell_vrts/
+qgis_cells_vrt/
+qgis_cells_vrt_abs/
+
+# Local experiments
+tiles.txt
+moema.vrt
+rgba_preview.png
+test_crop.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
 # ================================
 # IDE
 # ================================

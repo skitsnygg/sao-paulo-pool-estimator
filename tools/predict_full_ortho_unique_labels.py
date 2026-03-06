@@ -19,7 +19,7 @@ DEFAULT_STAGING_ROOT = Path("runs/debug")
 DEFAULT_IMGSZ = 1024
 DEFAULT_BATCH = 4
 DEFAULT_DEVICE = "mps"
-DEFAULT_CONF = 0.25
+DEFAULT_CONF = 0.15
 
 IMG_EXTS = {".jpg", ".jpeg", ".png"}
 
@@ -133,7 +133,7 @@ def run_yolo_predict(
         f"batch={batch}",
         f"device={device}",
         f"conf={conf}",
-        "save=True",
+        "save=False",
         "save_txt=True",
         "save_conf=True",
         "retina_masks=True",

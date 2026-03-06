@@ -26,6 +26,7 @@ from typing import Tuple
 import folium
 import geopandas as gpd
 import rasterio
+from folium.plugins import MousePosition
 from folium.raster_layers import ImageOverlay
 from rasterio.warp import transform_bounds
 
@@ -156,6 +157,11 @@ def main() -> None:
         center_lon = args.center_lon
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=args.zoom, tiles="OpenStreetMap")
+    MousePosition(
+        position="topright",
+        separator=" | ",
+        prefix="Lat/Lon:",
+    ).add_to(m)
 
     # Add imagery overlay
     ImageOverlay(

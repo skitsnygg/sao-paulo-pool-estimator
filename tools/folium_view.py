@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import folium
+from folium.plugins import MousePosition
 
 try:
     import geopandas as gpd
@@ -260,6 +261,99 @@ def add_predictions_layer(
     gj.add_to(m)
 
 
+def add_geojson_layer(
+    m: folium.Map,
+    geojson_path: Path,
+    layer_name: str,
+    color: str,
+    weight: float,
+    fill_opacity: float,
+) -> None:
+    if not geojson_path.exists():
+        raise SystemExit(f"GeoJSON layer not found: {geojson_path}")
+
+    gdf = gpd.read_file(geojson_path)
+    if gdf.empty:
+        return
+
+    # Coverage/hole helper layers are expected in WGS84. If no CRS is present, assume 4326.
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326", allow_override=True)
+    gdf_4326 = gdf.to_crs("EPSG:4326")
+
+    folium.GeoJson(
+        data=json.loads(gdf_4326.to_json()),
+        name=layer_name,
+        style_function=lambda _: {
+            "color": color,
+            "weight": float(weight),
+            "fillColor": color,
+            "fillOpacity": float(fill_opacity),
+        },
+    ).add_to(m)
+
+
+def add_cell_coverage_layer(
+    m: folium.Map,
+    geojson_path: Path,
+    layer_name: str,
+) -> None:
+    if not geojson_path.exists():
+        raise SystemExit(f"Cell coverage GeoJSON not found: {geojson_path}")
+
+    gdf = gpd.read_file(geojson_path)
+    if gdf.empty:
+        return
+
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326", allow_override=True)
+    gdf_4326 = gdf.to_crs("EPSG:4326")
+
+    # Normalize expected status values.
+    status_colors = {
+        "full": "#18A558",
+        "partial": "#FF8F00",
+        "empty": "#D32F2F",
+    }
+
+    tooltip_fields = [f for f in ["cell", "chip_count", "expected_chip_count", "missing_chip_count", "status"] if f in gdf_4326.columns]
+
+    folium.GeoJson(
+        data=json.loads(gdf_4326.to_json()),
+        name=layer_name,
+        style_function=lambda feat: {
+            "color": status_colors.get(str((feat.get("properties") or {}).get("status", "partial")), "#607D8B"),
+            "weight": 1.2,
+            "fillColor": status_colors.get(str((feat.get("properties") or {}).get("status", "partial")), "#607D8B"),
+            "fillOpacity": 0.18,
+        },
+        tooltip=folium.GeoJsonTooltip(fields=tooltip_fields, labels=True) if tooltip_fields else None,
+    ).add_to(m)
+
+
+def add_cell_coverage_legend(m: folium.Map) -> None:
+    legend_html = """
+    <div style="
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        z-index: 9999;
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid #cccccc;
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 12px;
+        line-height: 1.4;
+    ">
+      <div style="font-weight: 600; margin-bottom: 6px;">2020 Tile Coverage</div>
+      <div><span style="display:inline-block;width:10px;height:10px;background:#18A558;margin-right:6px;"></span>Full cell</div>
+      <div><span style="display:inline-block;width:10px;height:10px;background:#FF8F00;margin-right:6px;"></span>Partial cell</div>
+      <div><span style="display:inline-block;width:10px;height:10px;background:#D32F2F;margin-right:6px;"></span>Empty cell</div>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tiles-dir", required=True)
@@ -271,6 +365,18 @@ def main() -> None:
     ap.add_argument("--simplify-m", type=float, default=0.0)  # kept for compatibility; no-op unless you add it
     ap.add_argument("--max-features", type=int, default=0)
     ap.add_argument("--opacity", type=float, default=1.0)
+    ap.add_argument("--cell-coverage-geojson", default="", help="Optional WGS84 GeoJSON with per-cell chip counts/status")
+    ap.add_argument("--cell-coverage-label", default="Cell Coverage (Full/Partial/Empty)")
+    ap.add_argument("--coverage-geojson", default="", help="Optional WGS84 GeoJSON for local imagery coverage footprint")
+    ap.add_argument("--coverage-label", default="Local Imagery Coverage")
+    ap.add_argument("--coverage-color", default="#00FF66")
+    ap.add_argument("--coverage-weight", type=float, default=2.0)
+    ap.add_argument("--coverage-fill-opacity", type=float, default=0.06)
+    ap.add_argument("--holes-geojson", default="", help="Optional WGS84 GeoJSON for missing-tile hole polygons")
+    ap.add_argument("--holes-label", default="Missing Imagery Tiles")
+    ap.add_argument("--holes-color", default="#FF3B30")
+    ap.add_argument("--holes-weight", type=float, default=1.0)
+    ap.add_argument("--holes-fill-opacity", type=float, default=0.22)
     ap.add_argument(
         "--popup-fields",
         default="stem,conf,neighborhood,run_name",
@@ -296,6 +402,11 @@ def main() -> None:
     # Create map with canvas for performance
     # Start at 0,0; we will fit_bounds after we determine view_bounds_4326.
     m = folium.Map(location=[0.0, 0.0], zoom_start=2, prefer_canvas=True, control_scale=True)
+    MousePosition(
+        position="topright",
+        separator=" | ",
+        prefix="Lat/Lon:",
+    ).add_to(m)
 
     if args.base in ("google_sat", "both"):
         add_google_satellite(m)
@@ -306,7 +417,35 @@ def main() -> None:
 
     popup_fields = [s.strip() for s in str(args.popup_fields).split(",") if s.strip()]
 
-    # Add predictions
+    if str(args.cell_coverage_geojson).strip():
+        add_cell_coverage_layer(
+            m=m,
+            geojson_path=Path(args.cell_coverage_geojson),
+            layer_name=str(args.cell_coverage_label),
+        )
+        add_cell_coverage_legend(m)
+
+    if str(args.coverage_geojson).strip():
+        add_geojson_layer(
+            m=m,
+            geojson_path=Path(args.coverage_geojson),
+            layer_name=str(args.coverage_label),
+            color=str(args.coverage_color),
+            weight=float(args.coverage_weight),
+            fill_opacity=float(args.coverage_fill_opacity),
+        )
+
+    if str(args.holes_geojson).strip():
+        add_geojson_layer(
+            m=m,
+            geojson_path=Path(args.holes_geojson),
+            layer_name=str(args.holes_label),
+            color=str(args.holes_color),
+            weight=float(args.holes_weight),
+            fill_opacity=float(args.holes_fill_opacity),
+        )
+
+    # Keep predictions on top for easier visual + click inspection.
     add_predictions_layer(
         m,
         preds_4326,
@@ -345,6 +484,9 @@ def main() -> None:
         "pred_geojson": os.path.abspath(str(pred_geojson)),
         "base": args.base,
         "opacity": float(args.opacity),
+        "cell_coverage_geojson": os.path.abspath(args.cell_coverage_geojson) if str(args.cell_coverage_geojson).strip() else "",
+        "coverage_geojson": os.path.abspath(args.coverage_geojson) if str(args.coverage_geojson).strip() else "",
+        "holes_geojson": os.path.abspath(args.holes_geojson) if str(args.holes_geojson).strip() else "",
         "simplify_m": float(args.simplify_m),
         "centroids": bool(args.centroids),
         "max_features": int(args.max_features),
@@ -378,6 +520,7 @@ def main() -> None:
         f"overlay_bounds_4326={meta.get('overlay_bounds_4326')} "
         f"view_bounds_4326={meta.get('view_bounds_4326')}"
     )
+    
 
 
 if __name__ == "__main__":

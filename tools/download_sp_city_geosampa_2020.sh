@@ -2,139 +2,79 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-AOI="${ROOT}/data/external/aoi_sao_paulo_municipality_epsg31983.geojson"
-GRID_DIR="${ROOT}/data/external/sp_city_grid_2km_epsg31983"
-OUT_ROOT="${ROOT}/data/raw/geosampa_ortho/sp_city_2020"
-FAIL_LOG="${OUT_ROOT}/_failures.txt"
-
-STEP_METERS="${STEP_METERS:-2000}"
-CHIP_SIZE="${CHIP_SIZE:-1024}"
-METERS_PER_PIXEL="${METERS_PER_PIXEL:-0.10}"
-TIMEOUT_S="${TIMEOUT_S:-60}"
-SLEEP_S="${SLEEP_S:-0.10}"
-MAX_CHIPS="${MAX_CHIPS:-0}"   # 0 = no limit
-
 PY="${ROOT}/.venv/bin/python"
 
-if [[ ! -x "$PY" ]]; then
-  echo "Missing venv python: $PY" >&2
+GRID_DIR="${GRID_DIR:-${ROOT}/data/external/sp_city_grid_2km_epsg31983}"
+OUT_ROOT="${OUT_ROOT:-${ROOT}/data/raw/geosampa_ortho/sp_city_2020_rebuild}"
+COVERAGE_OUT="${COVERAGE_OUT:-${OUT_ROOT}/_coverage}"
+
+CRS="${CRS:-EPSG:31983}"
+CHIP_SIZE="${CHIP_SIZE:-1024}"
+METERS_PER_PIXEL="${METERS_PER_PIXEL:-0.10}"
+
+WMS="${WMS:-https://raster.geosampa.prefeitura.sp.gov.br/geoserver/wms}"
+LAYER="${LAYER:-geoportal:ORTO_RGB_2020}"
+WORKERS="${WORKERS:-10}"
+TIMEOUT="${TIMEOUT:-60}"
+REQUEST_RETRIES="${REQUEST_RETRIES:-4}"
+RETRY_DELAY="${RETRY_DELAY:-2.0}"
+MAX_ROUNDS="${MAX_ROUNDS:-12}"
+ROUND_SLEEP="${ROUND_SLEEP:-2.0}"
+MIN_BYTES="${MIN_BYTES:-4096}"
+
+# Default keeps old/broken dataset untouched by rebuilding into a new folder.
+CLEAN="${CLEAN:-1}"
+REUSE_EXISTING_FILES="${REUSE_EXISTING_FILES:-0}"
+PRESERVE_STATUS="${PRESERVE_STATUS:-0}"
+
+if [[ ! -x "${PY}" ]]; then
+  echo "Missing venv python: ${PY}" >&2
   exit 1
 fi
 
-if [[ ! -f "${AOI}" ]]; then
-  echo "Missing AOI GeoJSON: ${AOI}" >&2
+if [[ ! -d "${GRID_DIR}" ]]; then
+  echo "Missing grid dir: ${GRID_DIR}" >&2
   exit 1
 fi
 
-mkdir -p "${GRID_DIR}" "${OUT_ROOT}"
-: > "${FAIL_LOG}"
+cmd=(
+  "${PY}" "${ROOT}/tools/rebuild_sp_city_geosampa_2020.py" full-rebuild
+  --grid-dir "${GRID_DIR}"
+  --out-root "${OUT_ROOT}"
+  --coverage-out "${COVERAGE_OUT}"
+  --crs "${CRS}"
+  --chip-size "${CHIP_SIZE}"
+  --meters-per-pixel "${METERS_PER_PIXEL}"
+  --wms "${WMS}"
+  --layer "${LAYER}"
+  --workers "${WORKERS}"
+  --timeout "${TIMEOUT}"
+  --request-retries "${REQUEST_RETRIES}"
+  --retry-delay "${RETRY_DELAY}"
+  --max-rounds "${MAX_ROUNDS}"
+  --round-sleep "${ROUND_SLEEP}"
+  --min-bytes "${MIN_BYTES}"
+  --dst-crs "EPSG:4326"
+  --full-chip-count 50
+)
 
-echo "[grid] building ${STEP_METERS}m grid from ${AOI} -> ${GRID_DIR}"
+if [[ "${CLEAN}" == "1" ]]; then
+  cmd+=(--clean)
+fi
+if [[ "${REUSE_EXISTING_FILES}" == "1" ]]; then
+  cmd+=(--reuse-existing-files)
+fi
+if [[ "${PRESERVE_STATUS}" == "1" ]]; then
+  cmd+=(--preserve-status)
+fi
 
-AOI="${AOI}" GRID_DIR="${GRID_DIR}" STEP="${STEP_METERS}" PYTHONPATH=. "${PY}" - <<'PY'
-import json
-import os
-from pathlib import Path
+echo "[rebuild] grid=${GRID_DIR}"
+echo "[rebuild] out=${OUT_ROOT}"
+echo "[rebuild] coverage_out=${COVERAGE_OUT}"
+echo "[rebuild] wms=${WMS} layer=${LAYER}"
+echo "+ ${cmd[*]}"
 
-from shapely.geometry import box, shape, mapping
+PYTHONPATH=. "${cmd[@]}"
 
-aoi_path = Path(os.environ["AOI"])
-grid_dir = Path(os.environ["GRID_DIR"])
-step = float(os.environ.get("STEP", "2000"))
-
-grid_dir.mkdir(parents=True, exist_ok=True)
-
-payload = json.loads(aoi_path.read_text(encoding="utf-8"))
-gtype = payload.get("type")
-
-geoms = []
-if gtype == "FeatureCollection":
-    for f in payload.get("features", []):
-        g = f.get("geometry")
-        if g:
-            geoms.append(shape(g))
-elif gtype in ("Polygon", "MultiPolygon"):
-    geoms = [shape(payload)]
-else:
-    raise SystemExit(f"Unsupported GeoJSON type: {gtype}")
-
-if not geoms:
-    raise SystemExit("AOI has no geometries")
-
-# Union (avoid unary_union import; shapely geometry has union)
-geom = geoms[0]
-for g in geoms[1:]:
-    geom = geom.union(g)
-
-minx, miny, maxx, maxy = geom.bounds
-
-written = 0
-ix = 0
-y = miny
-while y < maxy:
-    x = minx
-    jx = 0
-    while x < maxx:
-        cell_poly = box(x, y, x + step, y + step)
-        inter = cell_poly.intersection(geom)
-        if (not inter.is_empty) and (inter.area > 1.0):
-            cell_id = f"cell_{ix:04d}_{jx:04d}"
-            out = grid_dir / f"{cell_id}.geojson"
-            fc = {
-                "type": "FeatureCollection",
-                "features": [{
-                    "type": "Feature",
-                    "properties": {"cell_id": cell_id},
-                    "geometry": mapping(inter),
-                }],
-            }
-            out.write_text(json.dumps(fc), encoding="utf-8")
-            written += 1
-        x += step
-        jx += 1
-    y += step
-    ix += 1
-
-print(f"cells_written: {written}")
-PY
-
-echo "[grid] cells: $(ls -1 "${GRID_DIR}"/*.geojson 2>/dev/null | wc -l | tr -d ' ')"
-
-# Download each cell
-for aoi in "${GRID_DIR}"/*.geojson; do
-  [[ -f "$aoi" ]] || continue
-  cell_id="$(basename "$aoi" .geojson)"
-  out_dir="${OUT_ROOT}/${cell_id}"
-
-  # skip if already done
-  if [[ -s "${out_dir}/chips.csv" ]]; then
-    echo "[skip] ${cell_id} (chips.csv exists)"
-    continue
-  fi
-
-  mkdir -p "${out_dir}"
-  echo "[download] ${cell_id}"
-
-  extra_max=()
-  if [[ "${MAX_CHIPS}" != "0" ]]; then
-    extra_max=(--max-chips "${MAX_CHIPS}")
-  fi
-
-  if ! PYTHONPATH=. "${PY}" -m src.data.fetch_geosampa_ortho \
-      --aoi-geojson "${aoi}" \
-      --aoi-crs "EPSG:31983" \
-      --crs "EPSG:31983" \
-      --chip-size "${CHIP_SIZE}" \
-      --meters-per-pixel "${METERS_PER_PIXEL}" \
-      --out-dir "${out_dir}" \
-      --timeout "${TIMEOUT_S}" \
-      --sleep "${SLEEP_S}" \
-      "${extra_max[@]}"
-  then
-    echo "[error] ${cell_id}" | tee -a "${FAIL_LOG}"
-    continue
-  fi
-done
-
-echo "[done] failures logged to ${FAIL_LOG}"
+echo "[done] manifest: ${OUT_ROOT}/chips_manifest.csv"
+echo "[done] coverage report: ${COVERAGE_OUT}/coverage_report.json"

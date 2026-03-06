@@ -2,59 +2,66 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RETRY_PATHS="${ROOT}/data/raw/geosampa_ortho/sp_city_2020/_retry_paths.txt"
-GRID_DIR="${ROOT}/data/external/aoi_sp_grid_2km"
-OUT_ROOT="${ROOT}/data/raw/geosampa_ortho/sp_city_2020"
+PY="${ROOT}/.venv/bin/python"
 
-if [[ ! -f "${RETRY_PATHS}" ]]; then
-  echo "Missing retry list: ${RETRY_PATHS}" >&2
+OUT_ROOT="${OUT_ROOT:-${ROOT}/data/raw/geosampa_ortho/sp_city_2020_rebuild}"
+COVERAGE_OUT="${COVERAGE_OUT:-${OUT_ROOT}/_coverage}"
+MANIFEST_CSV="${MANIFEST_CSV:-${OUT_ROOT}/chips_manifest.csv}"
+
+WMS="${WMS:-https://raster.geosampa.prefeitura.sp.gov.br/geoserver/wms}"
+LAYER="${LAYER:-geoportal:ORTO_RGB_2020}"
+CRS="${CRS:-EPSG:31983}"
+WORKERS="${WORKERS:-10}"
+TIMEOUT="${TIMEOUT:-60}"
+REQUEST_RETRIES="${REQUEST_RETRIES:-4}"
+RETRY_DELAY="${RETRY_DELAY:-2.0}"
+MAX_ROUNDS="${MAX_ROUNDS:-8}"
+ROUND_SLEEP="${ROUND_SLEEP:-2.0}"
+MIN_BYTES="${MIN_BYTES:-4096}"
+STATUSES="${STATUSES:-pending,failed,missing}"
+
+if [[ ! -x "${PY}" ]]; then
+  echo "Missing venv python: ${PY}" >&2
   exit 1
 fi
 
-tmp_cells="$(mktemp)"
-fail_log="${OUT_ROOT}/_retry_failures.txt"
-touch "${fail_log}"
+if [[ ! -f "${MANIFEST_CSV}" ]]; then
+  echo "Missing manifest CSV: ${MANIFEST_CSV}" >&2
+  exit 1
+fi
 
-PYTHONPATH=. "${ROOT}/.venv/bin/python" - <<'PY' "${RETRY_PATHS}" "${tmp_cells}"
-from pathlib import Path
-import re
-import sys
+cmd=(
+  "${PY}" "${ROOT}/tools/rebuild_sp_city_geosampa_2020.py" retry-until-complete
+  --out-root "${OUT_ROOT}"
+  --manifest-csv "${MANIFEST_CSV}"
+  --wms "${WMS}"
+  --layer "${LAYER}"
+  --crs "${CRS}"
+  --workers "${WORKERS}"
+  --timeout "${TIMEOUT}"
+  --request-retries "${REQUEST_RETRIES}"
+  --retry-delay "${RETRY_DELAY}"
+  --max-rounds "${MAX_ROUNDS}"
+  --round-sleep "${ROUND_SLEEP}"
+  --min-bytes "${MIN_BYTES}"
+  --statuses "${STATUSES}"
+)
 
-src = Path(sys.argv[1]).read_text().splitlines()
-cells = set()
-for line in src:
-    m = re.search(r"(cell_\d+_\d+)", line)
-    if not m:
-        continue
-    cells.add(m.group(1))
-cells = sorted(cells)
-Path(sys.argv[2]).write_text("\\n".join(cells) + "\\n", encoding="utf-8")
-print("cells:", len(cells))
-PY
+echo "[retry] out=${OUT_ROOT}"
+echo "+ ${cmd[*]}"
+PYTHONPATH=. "${cmd[@]}"
 
-while read -r cell; do
-  [[ -z "${cell}" ]] && continue
-  aoi="${GRID_DIR}/${cell}.geojson"
-  out="${OUT_ROOT}/${cell}"
-  if [[ ! -f "${aoi}" ]]; then
-    echo "[skip] ${cell} (missing AOI: ${aoi})" | tee -a "${fail_log}"
-    continue
-  fi
-  mkdir -p "${out}"
-  echo "[retry] ${cell}"
-  if ! PYTHONPATH=. "${ROOT}/.venv/bin/python" src/data/fetch_geosampa_ortho.py \
-      --aoi-geojson "${aoi}" \
-      --aoi-crs "EPSG:31983" \
-      --crs "EPSG:31983" \
-      --chip-size 1024 \
-      --meters-per-pixel 0.10 \
-      --out-dir "${out}" \
-      --timeout 60 \
-      --sleep 0.1; then
-    echo "[error] ${cell}" | tee -a "${fail_log}"
-    continue
-  fi
-done < "${tmp_cells}"
+validate_cmd=(
+  "${PY}" "${ROOT}/tools/rebuild_sp_city_geosampa_2020.py" validate
+  --out-root "${OUT_ROOT}"
+  --manifest-csv "${MANIFEST_CSV}"
+  --coverage-out "${COVERAGE_OUT}"
+  --crs "${CRS}"
+  --dst-crs "EPSG:4326"
+  --full-chip-count 50
+)
 
-rm -f "${tmp_cells}"
-echo "[done] failures logged to ${fail_log}"
+echo "+ ${validate_cmd[*]}"
+PYTHONPATH=. "${validate_cmd[@]}"
+
+echo "[done] coverage report: ${COVERAGE_OUT}/coverage_report.json"

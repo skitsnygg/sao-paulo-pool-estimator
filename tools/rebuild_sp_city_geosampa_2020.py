@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+# !/usr/bin/env python3
+from __future__ import annotations
 
 import argparse
 import csv
 import json
 import math
 import shutil
+import sys
 import threading
 import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import requests
 from PIL import Image

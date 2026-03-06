@@ -22,7 +22,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import folium
 
@@ -208,6 +208,7 @@ def add_predictions_layer(
     m: folium.Map,
     preds_4326: "gpd.GeoDataFrame",
     centroids: bool,
+    popup_fields: Optional[List[str]] = None,
 ) -> None:
     if centroids:
         # Render points for speed
@@ -229,6 +230,17 @@ def add_predictions_layer(
         return
 
     # Render polygons as GeoJSON
+    popup = None
+    if popup_fields:
+        valid_popup_fields = [f for f in popup_fields if f in preds_4326.columns]
+        if valid_popup_fields:
+            popup = folium.GeoJsonPopup(
+                fields=valid_popup_fields,
+                labels=True,
+                localize=True,
+                max_width=900,
+            )
+
     gj = folium.GeoJson(
         data=json.loads(preds_4326.to_json()),
         name="Pools",
@@ -238,6 +250,12 @@ def add_predictions_layer(
             "fillColor": "#00FFFF",
             "fillOpacity": 0.25,
         },
+        highlight_function=lambda _: {
+            "color": "#FFFF00",
+            "weight": 2,
+            "fillOpacity": 0.35,
+        },
+        popup=popup,
     )
     gj.add_to(m)
 
@@ -253,6 +271,11 @@ def main() -> None:
     ap.add_argument("--simplify-m", type=float, default=0.0)  # kept for compatibility; no-op unless you add it
     ap.add_argument("--max-features", type=int, default=0)
     ap.add_argument("--opacity", type=float, default=1.0)
+    ap.add_argument(
+        "--popup-fields",
+        default="stem,conf,neighborhood,run_name",
+        help="Comma-separated properties to show when clicking polygons",
+    )
     args = ap.parse_args()
 
     name = args.name
@@ -281,8 +304,15 @@ def main() -> None:
     if args.base in ("geosampa_png", "both"):
         overlay_bounds_4326 = add_geosampa_overlay(m, out_dir=out_dir, name=name, opacity=float(args.opacity))
 
+    popup_fields = [s.strip() for s in str(args.popup_fields).split(",") if s.strip()]
+
     # Add predictions
-    add_predictions_layer(m, preds_4326, centroids=bool(args.centroids))
+    add_predictions_layer(
+        m,
+        preds_4326,
+        centroids=bool(args.centroids),
+        popup_fields=popup_fields,
+    )
 
     # Decide view bounds
     pred_bounds_4326 = tuple(pred_meta["pred_bounds_4326"])  # type: ignore
@@ -318,6 +348,7 @@ def main() -> None:
         "simplify_m": float(args.simplify_m),
         "centroids": bool(args.centroids),
         "max_features": int(args.max_features),
+        "popup_fields": popup_fields,
         # Back-compat key (your old file had bounds_4326):
         "bounds_4326": list(view_bounds_4326),
         # New explicit keys:

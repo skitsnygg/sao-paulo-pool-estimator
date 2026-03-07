@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+# !/usr/bin/env python3
+from __future__ import annotations
 
 import argparse
 import csv
@@ -9,7 +11,6 @@ import shutil
 import sys
 import threading
 import time
-from io import BytesIO
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import requests
@@ -63,29 +65,12 @@ class DownloadJob:
     cell_id: str
     chip_id: str
     path: Path
-    row: int
-    col: int
     xmin: float
     ymin: float
     xmax: float
     ymax: float
     width: int
     height: int
-
-
-@dataclass(frozen=True)
-class BlockDownloadJob:
-    chips: Tuple[DownloadJob, ...]
-    xmin: float
-    ymin: float
-    xmax: float
-    ymax: float
-    width: int
-    height: int
-    min_row: int
-    max_row: int
-    min_col: int
-    max_col: int
 
 
 @dataclass(frozen=True)
@@ -332,6 +317,8 @@ def _verify_image_content(data: bytes, min_bytes: int) -> Tuple[bool, str]:
         return False, f"too_small:{len(data)}"
 
     try:
+        from io import BytesIO
+
         with Image.open(BytesIO(data)) as im:
             im.verify()
         return True, ""
@@ -339,17 +326,7 @@ def _verify_image_content(data: bytes, min_bytes: int) -> Tuple[bool, str]:
         return False, f"invalid_image:{type(exc).__name__}"
 
 
-def _build_wms_params(
-    *,
-    layer: str,
-    crs: str,
-    xmin: float,
-    ymin: float,
-    xmax: float,
-    ymax: float,
-    width: int,
-    height: int,
-) -> Dict[str, str]:
+def _build_wms_params(job: DownloadJob, layer: str, crs: str) -> Dict[str, str]:
     return {
         "service": "WMS",
         "request": "GetMap",
@@ -357,190 +334,17 @@ def _build_wms_params(
         "layers": layer,
         "styles": "",
         "crs": crs,
-        "bbox": f"{xmin},{ymin},{xmax},{ymax}",
-        "width": str(width),
-        "height": str(height),
+        "bbox": f"{job.xmin},{job.ymin},{job.xmax},{job.ymax}",
+        "width": str(job.width),
+        "height": str(job.height),
         "format": "image/png",
         "transparent": "false",
     }
 
 
-def build_download_jobs(
+def download_one_job(
     *,
-    rows: List[Dict[str, str]],
-    statuses: set[str],
-    max_jobs: int,
-) -> List[DownloadJob]:
-    jobs: List[DownloadJob] = []
-    for i, row in enumerate(rows):
-        status = row.get("status", "pending")
-        if status not in statuses:
-            continue
-        jobs.append(
-            DownloadJob(
-                index=i,
-                cell_id=row["cell_id"],
-                chip_id=row["chip_id"],
-                path=Path(row["path"]),
-                row=normalize_int(row.get("row", "0"), 0),
-                col=normalize_int(row.get("col", "0"), 0),
-                xmin=normalize_float(row["xmin"]),
-                ymin=normalize_float(row["ymin"]),
-                xmax=normalize_float(row["xmax"]),
-                ymax=normalize_float(row["ymax"]),
-                width=normalize_int(row["width_px"], 1024),
-                height=normalize_int(row["height_px"], 1024),
-            )
-        )
-
-    if max_jobs > 0:
-        jobs = jobs[:max_jobs]
-    return jobs
-
-
-def build_block_jobs(
-    *,
-    jobs: List[DownloadJob],
-    block_rows: int,
-    block_cols: int,
-) -> List[BlockDownloadJob]:
-    if not jobs:
-        return []
-
-    br = max(1, int(block_rows))
-    bc = max(1, int(block_cols))
-
-    grouped: Dict[Tuple[str, int, int, int, int], List[DownloadJob]] = defaultdict(list)
-    for job in jobs:
-        key = (job.cell_id, job.width, job.height, job.row // br, job.col // bc)
-        grouped[key].append(job)
-
-    block_jobs: List[BlockDownloadJob] = []
-    for key in sorted(grouped.keys()):
-        group = grouped[key]
-        min_row = min(j.row for j in group)
-        max_row = max(j.row for j in group)
-        min_col = min(j.col for j in group)
-        max_col = max(j.col for j in group)
-        width = (max_col - min_col + 1) * group[0].width
-        height = (max_row - min_row + 1) * group[0].height
-        block_jobs.append(
-            BlockDownloadJob(
-                chips=tuple(sorted(group, key=lambda j: (j.row, j.col, j.index))),
-                xmin=min(j.xmin for j in group),
-                ymin=min(j.ymin for j in group),
-                xmax=max(j.xmax for j in group),
-                ymax=max(j.ymax for j in group),
-                width=width,
-                height=height,
-                min_row=min_row,
-                max_row=max_row,
-                min_col=min_col,
-                max_col=max_col,
-            )
-        )
-
-    block_jobs.sort(key=lambda b: min(j.index for j in b.chips))
-    return block_jobs
-
-
-def _block_results(
-    *,
-    block: BlockDownloadJob,
-    status: str,
-    http_status: str,
-    content_type: str,
-    attempts_made: int,
-    error: str,
-) -> List[DownloadResult]:
-    return [
-        DownloadResult(
-            index=chip.index,
-            status=status,
-            http_status=http_status,
-            content_type=content_type,
-            attempts_made=attempts_made,
-            error=error,
-        )
-        for chip in block.chips
-    ]
-
-
-def _slice_block_to_chips(
-    *,
-    image_data: bytes,
-    block: BlockDownloadJob,
-    attempts_made: int,
-    http_status: str,
-    content_type: str,
-) -> List[DownloadResult]:
-    results: List[DownloadResult] = []
-
-    with Image.open(BytesIO(image_data)) as im:
-        if im.size != (block.width, block.height):
-            return _block_results(
-                block=block,
-                status="failed",
-                http_status=http_status,
-                content_type=content_type,
-                attempts_made=attempts_made,
-                error=f"unexpected_image_size:{im.size[0]}x{im.size[1]}",
-            )
-
-        for chip in block.chips:
-            x_offset = (chip.col - block.min_col) * chip.width
-            y_offset = (block.max_row - chip.row) * chip.height
-            x_end = x_offset + chip.width
-            y_end = y_offset + chip.height
-
-            if x_offset < 0 or y_offset < 0 or x_end > block.width or y_end > block.height:
-                results.append(
-                    DownloadResult(
-                        index=chip.index,
-                        status="failed",
-                        http_status=http_status,
-                        content_type=content_type,
-                        attempts_made=attempts_made,
-                        error=f"slice_oob:x={x_offset}:{x_end},y={y_offset}:{y_end}",
-                    )
-                )
-                continue
-
-            try:
-                ensure_dir(chip.path.parent)
-                tile = im.crop((x_offset, y_offset, x_end, y_end))
-                tmp_path = chip.path.with_suffix(".tmp")
-                tile.save(tmp_path, format="PNG")
-                tmp_path.replace(chip.path)
-                _write_world_file(chip.path, chip.xmin, chip.ymin, chip.xmax, chip.ymax, chip.width, chip.height)
-                results.append(
-                    DownloadResult(
-                        index=chip.index,
-                        status="downloaded",
-                        http_status=http_status,
-                        content_type=content_type,
-                        attempts_made=attempts_made,
-                        error="",
-                    )
-                )
-            except Exception as exc:
-                results.append(
-                    DownloadResult(
-                        index=chip.index,
-                        status="failed",
-                        http_status=http_status,
-                        content_type=content_type,
-                        attempts_made=attempts_made,
-                        error=f"slice_write_error:{type(exc).__name__}",
-                    )
-                )
-
-    return results
-
-
-def download_one_block(
-    *,
-    block: BlockDownloadJob,
+    job: DownloadJob,
     wms_url: str,
     layer: str,
     crs: str,
@@ -548,7 +352,7 @@ def download_one_block(
     request_retries: int,
     retry_delay: float,
     min_bytes: int,
-) -> List[DownloadResult]:
+) -> DownloadResult:
     attempts_made = 0
     last_http = ""
     last_content_type = ""
@@ -560,16 +364,7 @@ def download_one_block(
             sess = _get_session()
             resp = sess.get(
                 wms_url,
-                params=_build_wms_params(
-                    layer=layer,
-                    crs=crs,
-                    xmin=block.xmin,
-                    ymin=block.ymin,
-                    xmax=block.xmax,
-                    ymax=block.ymax,
-                    width=block.width,
-                    height=block.height,
-                ),
+                params=_build_wms_params(job, layer, crs),
                 timeout=timeout,
             )
             last_http = str(resp.status_code)
@@ -582,8 +377,8 @@ def download_one_block(
                     if attempt < request_retries:
                         time.sleep(retry_delay * (2 ** attempt))
                         continue
-                    return _block_results(
-                        block=block,
+                    return DownloadResult(
+                        index=job.index,
                         status="failed",
                         http_status=last_http,
                         content_type=last_content_type,
@@ -591,24 +386,19 @@ def download_one_block(
                         error=last_error,
                     )
 
-                try:
-                    return _slice_block_to_chips(
-                        image_data=resp.content,
-                        block=block,
-                        attempts_made=attempts_made,
-                        http_status=last_http,
-                        content_type=last_content_type,
-                    )
-                except Exception as exc:
-                    last_error = f"slice_error:{type(exc).__name__}"
-                    return _block_results(
-                        block=block,
-                        status="failed",
-                        http_status=last_http,
-                        content_type=last_content_type,
-                        attempts_made=attempts_made,
-                        error=last_error,
-                    )
+                ensure_dir(job.path.parent)
+                tmp_path = job.path.with_suffix(".tmp")
+                tmp_path.write_bytes(resp.content)
+                tmp_path.replace(job.path)
+                _write_world_file(job.path, job.xmin, job.ymin, job.xmax, job.ymax, job.width, job.height)
+                return DownloadResult(
+                    index=job.index,
+                    status="downloaded",
+                    http_status=last_http,
+                    content_type=last_content_type,
+                    attempts_made=attempts_made,
+                    error="",
+                )
 
             if resp.status_code in RETRYABLE_HTTP_CODES and attempt < request_retries:
                 last_error = f"http_{resp.status_code}"
@@ -617,8 +407,8 @@ def download_one_block(
 
             if resp.status_code >= 400 and resp.status_code < 500 and resp.status_code != 429:
                 last_error = f"http_{resp.status_code}"
-                return _block_results(
-                    block=block,
+                return DownloadResult(
+                    index=job.index,
                     status="missing",
                     http_status=last_http,
                     content_type=last_content_type,
@@ -629,8 +419,8 @@ def download_one_block(
             if resp.status_code == 200 and not last_content_type.startswith("image"):
                 body = (resp.text or "").strip().replace("\n", " ")[:160]
                 last_error = f"non_image_response:{body}" if body else "non_image_response"
-                return _block_results(
-                    block=block,
+                return DownloadResult(
+                    index=job.index,
                     status="missing",
                     http_status=last_http,
                     content_type=last_content_type,
@@ -648,8 +438,8 @@ def download_one_block(
                 time.sleep(retry_delay * (2 ** attempt))
                 continue
 
-    return _block_results(
-        block=block,
+    return DownloadResult(
+        index=job.index,
         status="failed",
         http_status=last_http,
         content_type=last_content_type,
@@ -671,26 +461,41 @@ def run_download_round(
     retry_delay: float,
     min_bytes: int,
     max_jobs: int,
-    block_rows: int,
-    block_cols: int,
 ) -> Counter:
-    jobs = build_download_jobs(rows=rows, statuses=statuses, max_jobs=max_jobs)
+    jobs: List[DownloadJob] = []
+    for i, row in enumerate(rows):
+        status = row.get("status", "pending")
+        if status not in statuses:
+            continue
+        jobs.append(
+            DownloadJob(
+                index=i,
+                cell_id=row["cell_id"],
+                chip_id=row["chip_id"],
+                path=Path(row["path"]),
+                xmin=normalize_float(row["xmin"]),
+                ymin=normalize_float(row["ymin"]),
+                xmax=normalize_float(row["xmax"]),
+                ymax=normalize_float(row["ymax"]),
+                width=normalize_int(row["width_px"], 1024),
+                height=normalize_int(row["height_px"], 1024),
+            )
+        )
+
+    if max_jobs > 0:
+        jobs = jobs[:max_jobs]
+
     if not jobs:
         return Counter()
 
-    blocks = build_block_jobs(jobs=jobs, block_rows=block_rows, block_cols=block_cols)
-    req_reduction = (float(len(jobs)) / float(len(blocks))) if blocks else 1.0
-    print(
-        f"download_jobs={len(jobs)} block_jobs={len(blocks)} block_size={max(1, block_rows)}x{max(1, block_cols)} "
-        f"workers={workers} statuses={sorted(statuses)} req_reduction={req_reduction:.2f}x"
-    )
+    print(f"download_jobs={len(jobs)} workers={workers} statuses={sorted(statuses)}")
 
     counts = Counter()
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [
             ex.submit(
-                download_one_block,
-                block=block,
+                download_one_job,
+                job=job,
                 wms_url=wms_url,
                 layer=layer,
                 crs=crs,
@@ -699,20 +504,19 @@ def run_download_round(
                 retry_delay=retry_delay,
                 min_bytes=min_bytes,
             )
-            for block in blocks
+            for job in jobs
         ]
 
         for fut in as_completed(futs):
-            results = fut.result()
-            for res in results:
-                row = rows[res.index]
-                row["status"] = res.status
-                row["http_status"] = res.http_status
-                row["content_type"] = res.content_type
-                row["attempts"] = str(normalize_int(row.get("attempts", "0"), 0) + res.attempts_made)
-                row["last_error"] = res.error
-                row["last_update"] = now_iso()
-                counts[res.status] += 1
+            res = fut.result()
+            row = rows[res.index]
+            row["status"] = res.status
+            row["http_status"] = res.http_status
+            row["content_type"] = res.content_type
+            row["attempts"] = str(normalize_int(row.get("attempts", "0"), 0) + res.attempts_made)
+            row["last_error"] = res.error
+            row["last_update"] = now_iso()
+            counts[res.status] += 1
 
     return counts
 
@@ -1023,8 +827,6 @@ def cmd_download(args: argparse.Namespace) -> int:
         retry_delay=args.retry_delay,
         min_bytes=args.min_bytes,
         max_jobs=args.max_jobs,
-        block_rows=args.block_rows,
-        block_cols=args.block_cols,
     )
 
     write_manifest_and_cells(out_root, rows)
@@ -1059,8 +861,6 @@ def cmd_retry_until_complete(args: argparse.Namespace) -> int:
             retry_delay=args.retry_delay,
             min_bytes=args.min_bytes,
             max_jobs=args.max_jobs,
-            block_rows=args.block_rows,
-            block_cols=args.block_cols,
         )
 
         write_manifest_and_cells(out_root, rows)
@@ -1143,8 +943,6 @@ def cmd_full_rebuild(args: argparse.Namespace) -> int:
             retry_delay=args.retry_delay,
             min_bytes=args.min_bytes,
             max_jobs=args.max_jobs,
-            block_rows=args.block_rows,
-            block_cols=args.block_cols,
         )
 
         write_manifest_and_cells(out_root, rows)
@@ -1196,8 +994,6 @@ def add_download_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--wms", default=WMS_BASE_URL)
     p.add_argument("--layer", default=ORTHO_LAYER)
     p.add_argument("--workers", type=int, default=10)
-    p.add_argument("--block-rows", type=int, default=4, help="Rows per WMS block request (1 disables row grouping)")
-    p.add_argument("--block-cols", type=int, default=4, help="Cols per WMS block request (1 disables col grouping)")
     p.add_argument("--timeout", type=int, default=60)
     p.add_argument("--request-retries", type=int, default=4)
     p.add_argument("--retry-delay", type=float, default=2.0)

@@ -12,8 +12,6 @@ WMS="${WMS:-https://raster.geosampa.prefeitura.sp.gov.br/geoserver/wms}"
 LAYER="${LAYER:-geoportal:ORTO_RGB_2020}"
 CRS="${CRS:-EPSG:31983}"
 WORKERS="${WORKERS:-10}"
-BLOCK_ROWS="${BLOCK_ROWS:-4}"
-BLOCK_COLS="${BLOCK_COLS:-4}"
 TIMEOUT="${TIMEOUT:-60}"
 REQUEST_RETRIES="${REQUEST_RETRIES:-4}"
 RETRY_DELAY="${RETRY_DELAY:-2.0}"
@@ -40,8 +38,6 @@ cmd=(
   --layer "${LAYER}"
   --crs "${CRS}"
   --workers "${WORKERS}"
-  --block-rows "${BLOCK_ROWS}"
-  --block-cols "${BLOCK_COLS}"
   --timeout "${TIMEOUT}"
   --request-retries "${REQUEST_RETRIES}"
   --retry-delay "${RETRY_DELAY}"
@@ -52,7 +48,6 @@ cmd=(
 )
 
 echo "[retry] out=${OUT_ROOT}"
-echo "[retry] workers=${WORKERS} block=${BLOCK_ROWS}x${BLOCK_COLS}"
 echo "+ ${cmd[*]}"
 PYTHONPATH=. "${cmd[@]}"
 

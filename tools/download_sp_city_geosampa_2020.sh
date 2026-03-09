@@ -7,7 +7,7 @@ PY="${ROOT}/.venv/bin/python"
 GRID_DIR="${GRID_DIR:-${ROOT}/data/external/sp_city_grid_2km_epsg31983}"
 OUT_ROOT="${OUT_ROOT:-${ROOT}/data/raw/geosampa_ortho/sp_city_2020_rebuild}"
 COVERAGE_OUT="${COVERAGE_OUT:-${OUT_ROOT}/_coverage}"
-
+2
 CRS="${CRS:-EPSG:31983}"
 CHIP_SIZE="${CHIP_SIZE:-1024}"
 METERS_PER_PIXEL="${METERS_PER_PIXEL:-0.10}"

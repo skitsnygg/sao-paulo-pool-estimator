@@ -947,11 +947,34 @@ def run_render_round(
 ) -> Counter:
     jobs: List[RenderJob] = []
     counts = Counter()
+    source_bounds: Optional[Tuple[float, float, float, float]] = None
+
+    # Fast skip for chips completely outside source extent when source/destination CRS match.
+    try:
+        with rasterio.open(source_vrt) as ds:
+            src_crs = ds.crs.to_string() if ds.crs is not None else ""
+            if not src_crs and assume_source_crs.strip():
+                src_crs = assume_source_crs.strip()
+            if src_crs.strip().upper() == dst_crs.strip().upper():
+                b = ds.bounds
+                source_bounds = (float(b.left), float(b.bottom), float(b.right), float(b.top))
+    except Exception:
+        source_bounds = None
+
+    def _intersects(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> bool:
+        return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
 
     for i, row in enumerate(rows):
         status = row.get("status", "pending")
         if status not in statuses:
             continue
+
+        xmin = rebuild.normalize_float(row.get("xmin", "0"), 0.0)
+        ymin = rebuild.normalize_float(row.get("ymin", "0"), 0.0)
+        xmax = rebuild.normalize_float(row.get("xmax", "0"), 0.0)
+        ymax = rebuild.normalize_float(row.get("ymax", "0"), 0.0)
+        width = rebuild.normalize_int(row.get("width_px", "1024"), 1024)
+        height = rebuild.normalize_int(row.get("height_px", "1024"), 1024)
 
         path = Path(row["path"])
         if not overwrite_existing and path.exists() and path.with_suffix(".pgw").exists():
@@ -963,16 +986,25 @@ def run_render_round(
             counts["cached"] += 1
             continue
 
+        if source_bounds is not None and not _intersects((xmin, ymin, xmax, ymax), source_bounds):
+            row["status"] = "missing"
+            row["http_status"] = "local_outside_source_bounds"
+            row["content_type"] = "image/png"
+            row["last_error"] = "outside_source_bounds"
+            row["last_update"] = rebuild.now_iso()
+            counts["missing"] += 1
+            continue
+
         jobs.append(
             RenderJob(
                 index=i,
                 path=path,
-                xmin=rebuild.normalize_float(row.get("xmin", "0"), 0.0),
-                ymin=rebuild.normalize_float(row.get("ymin", "0"), 0.0),
-                xmax=rebuild.normalize_float(row.get("xmax", "0"), 0.0),
-                ymax=rebuild.normalize_float(row.get("ymax", "0"), 0.0),
-                width=rebuild.normalize_int(row.get("width_px", "1024"), 1024),
-                height=rebuild.normalize_int(row.get("height_px", "1024"), 1024),
+                xmin=xmin,
+                ymin=ymin,
+                xmax=xmax,
+                ymax=ymax,
+                width=width,
+                height=height,
             )
         )
 
@@ -980,7 +1012,10 @@ def run_render_round(
         jobs = jobs[:max_jobs]
 
     if jobs:
-        print(f"render_jobs={len(jobs)} workers={workers} statuses={sorted(statuses)}")
+        print(
+            f"render_jobs={len(jobs)} workers={workers} statuses={sorted(statuses)} "
+            f"prefilter_missing={counts.get('missing', 0)}"
+        )
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [

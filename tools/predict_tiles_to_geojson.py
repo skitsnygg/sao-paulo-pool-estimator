@@ -1,6 +1,8 @@
+
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 from dataclasses import dataclass
@@ -30,15 +32,15 @@ class InferenceStats:
     polys_dropped_area_m2: int = 0
 
 
+GeoTransform = Tuple[float, float, float, float, float, float]
+_TRANSFORMERS: Dict[Tuple[str, str], Transformer] = {}
+
+
 def mercator_lat_from_t(t: float) -> float:
     return math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * t))))
 
 
 def lonlat_from_xyz_pixel(z: int, x: int, y: int, px: float, py: float, w: int, h: int) -> Tuple[float, float]:
-    """
-    Convert pixel coordinates within an XYZ tile image into lon/lat (WGS84).
-    Assumes the image covers exactly one XYZ tile at zoom z, tile coords (x,y).
-    """
     n = 2 ** z
     fx = x + (px / w)
     fy = y + (py / h)
@@ -48,15 +50,9 @@ def lonlat_from_xyz_pixel(z: int, x: int, y: int, px: float, py: float, w: int, 
 
 
 def parse_xy_from_path(p: Path) -> Tuple[int, int]:
-    """
-    Expect filenames like: 97086_148749.jpg -> x=97086, y=148749
-    """
     stem = p.stem
     a, b = stem.split("_", 1)
     return int(a), int(b)
-
-
-GeoTransform = Tuple[float, float, float, float, float, float]
 
 
 def is_geotiff(p: Path) -> bool:
@@ -98,7 +94,7 @@ def read_geotiff_image(p: Path) -> Tuple[np.ndarray, GeoTransform, str]:
             return arr, transform, crs
 
     try:
-        from osgeo import gdal, osr
+        from osgeo import gdal
     except Exception as exc:
         raise RuntimeError("rasterio or GDAL Python bindings are required to read GeoTIFFs") from exc
 
@@ -137,9 +133,6 @@ def pixel_to_projected(transform: GeoTransform, px: float, py: float) -> Tuple[f
     return geo_x, geo_y
 
 
-_TRANSFORMERS: Dict[Tuple[str, str], Transformer] = {}
-
-
 def get_transformer(src_crs: str, dst_crs: str) -> Transformer:
     key = (src_crs, dst_crs)
     if key not in _TRANSFORMERS:
@@ -155,7 +148,6 @@ def transform_ring(ring: List[List[float]], src_crs: str, dst_crs: str) -> List[
 
 
 def poly_area_px(poly_xy: List[Tuple[float, float]]) -> float:
-    """Shoelace polygon area in pixel space."""
     if len(poly_xy) < 3:
         return 0.0
     area = 0.0
@@ -256,10 +248,6 @@ def _normalize_ring(ring: List[List[float]], precision: int) -> List[List[float]
 
 
 def looks_normalized(poly_xy: List[Tuple[float, float]]) -> bool:
-    """
-    Heuristic: if all coordinates are between [0, 1.5], treat as normalized coords.
-    (Some implementations may return 0..1 or slightly outside due to rounding.)
-    """
     if not poly_xy:
         return False
     xs = [p[0] for p in poly_xy]
@@ -291,21 +279,11 @@ def find_worldfile(img: Path) -> Optional[Path]:
     suffix = img.suffix.lower()
     candidates: List[Path] = []
     if suffix == ".png":
-        candidates.extend([
-            img.with_suffix(".pgw"),
-            img.with_suffix(".wld"),
-            img.with_suffix(".pngw"),
-        ])
+        candidates.extend([img.with_suffix(".pgw"), img.with_suffix(".wld"), img.with_suffix(".pngw")])
     elif suffix in (".jpg", ".jpeg"):
-        candidates.extend([
-            img.with_suffix(".jgw"),
-            img.with_suffix(".wld"),
-            img.with_suffix(".jpgw"),
-        ])
+        candidates.extend([img.with_suffix(".jgw"), img.with_suffix(".wld"), img.with_suffix(".jpgw")])
     else:
-        candidates.extend([
-            img.with_suffix(".wld"),
-        ])
+        candidates.extend([img.with_suffix(".wld")])
     for p in candidates:
         if p.exists():
             return p
@@ -337,9 +315,7 @@ def _mask_areas_from_masks(masks: Any) -> Optional[List[float]]:
         return None
 
     try:
-        if arr is None:
-            return None
-        if getattr(arr, "ndim", None) != 3:
+        if arr is None or getattr(arr, "ndim", None) != 3:
             return None
         mask = arr > 0.5
         areas = mask.sum(axis=(1, 2))
@@ -348,9 +324,69 @@ def _mask_areas_from_masks(masks: Any) -> Optional[List[float]]:
         return None
 
 
+def path_parts_info(tiles_root: Path, p: Path) -> Tuple[str, str, str]:
+    rel = p.relative_to(tiles_root)
+    tile_rel = rel.as_posix()
+    cell = ""
+    for part in rel.parts:
+        if part.startswith("cell_"):
+            cell = part
+            break
+    return tile_rel, cell, rel.stem
+
+
+def is_blank_white_tile(p: Path, mean_thresh: float, std_thresh: float) -> bool:
+    try:
+        from PIL import Image, ImageStat
+        im = Image.open(p).convert("RGB")
+        stat = ImageStat.Stat(im)
+        mean = sum(stat.mean) / 3.0
+        std = sum(stat.stddev) / 3.0
+        return mean >= mean_thresh and std <= std_thresh
+    except Exception:
+        return False
+
+
+def append_tile_summary(
+    rows: List[Dict[str, Any]],
+    *,
+    tile_rel: str,
+    tile_name: str,
+    tile_stem: str,
+    cell: str,
+    tile_path_abs: str,
+    blank_white: bool,
+    num_preds: int,
+    min_conf: Optional[float],
+    mean_conf: Optional[float],
+    max_conf: Optional[float],
+    max_area_m2: Optional[float],
+    sum_area_m2: float,
+    max_mask_area_px: Optional[float],
+) -> None:
+    rows.append(
+        {
+            "tile_rel": tile_rel,
+            "tile": tile_name,
+            "tile_stem": tile_stem,
+            "cell": cell,
+            "tile_path_abs": tile_path_abs,
+            "blank_white": int(bool(blank_white)),
+            "num_preds": int(num_preds),
+            "min_conf": "" if min_conf is None else float(min_conf),
+            "mean_conf": "" if mean_conf is None else float(mean_conf),
+            "max_conf": "" if max_conf is None else float(max_conf),
+            "max_area_m2": "" if max_area_m2 is None else float(max_area_m2),
+            "sum_area_m2": float(sum_area_m2),
+            "max_mask_area_px": "" if max_mask_area_px is None else float(max_mask_area_px),
+        }
+    )
+
+
 def run_inference(
     *,
     model_path: Path,
+    tiles_root: Path,
     tiles: Sequence[Path],
     z: Optional[int],
     imgsz: int,
@@ -365,6 +401,9 @@ def run_inference(
     verbose: bool,
     precision: int,
     worldfile_crs: str,
+    tile_summary_rows: Optional[List[Dict[str, Any]]],
+    white_mean_threshold: float,
+    white_std_threshold: float,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], InferenceStats]:
     from PIL import Image
 
@@ -376,6 +415,9 @@ def run_inference(
 
     for p in tiles:
         stats.tiles_processed += 1
+
+        tile_rel, cell, tile_stem = path_parts_info(tiles_root, p)
+        blank_white = is_blank_white_tile(p, white_mean_threshold, white_std_threshold)
 
         use_geotiff = is_geotiff(p)
         worldfile = None if use_geotiff else find_worldfile(p)
@@ -392,6 +434,8 @@ def run_inference(
             except Exception as e:
                 if verbose:
                     print(f"[skip] {p.name}: cannot read GeoTIFF ({e})")
+                if tile_summary_rows is not None:
+                    append_tile_summary(tile_summary_rows, tile_rel=tile_rel, tile_name=p.name, tile_stem=tile_stem, cell=cell, tile_path_abs=str(p.resolve()), blank_white=blank_white, num_preds=0, min_conf=None, mean_conf=None, max_conf=None, max_area_m2=None, sum_area_m2=0.0, max_mask_area_px=None)
                 continue
             h, w = img.shape[:2]
             try:
@@ -404,6 +448,8 @@ def run_inference(
             except Exception as e:
                 if verbose:
                     print(f"[skip] {p.name}: cannot open image ({e})")
+                if tile_summary_rows is not None:
+                    append_tile_summary(tile_summary_rows, tile_rel=tile_rel, tile_name=p.name, tile_stem=tile_stem, cell=cell, tile_path_abs=str(p.resolve()), blank_white=blank_white, num_preds=0, min_conf=None, mean_conf=None, max_conf=None, max_area_m2=None, sum_area_m2=0.0, max_mask_area_px=None)
                 continue
 
             if use_worldfile:
@@ -413,6 +459,8 @@ def run_inference(
                 except Exception as e:
                     if verbose:
                         print(f"[skip] {p.name}: cannot read worldfile ({e})")
+                    if tile_summary_rows is not None:
+                        append_tile_summary(tile_summary_rows, tile_rel=tile_rel, tile_name=p.name, tile_stem=tile_stem, cell=cell, tile_path_abs=str(p.resolve()), blank_white=blank_white, num_preds=0, min_conf=None, mean_conf=None, max_conf=None, max_area_m2=None, sum_area_m2=0.0, max_mask_area_px=None)
                     continue
             else:
                 try:
@@ -420,37 +468,25 @@ def run_inference(
                 except Exception as e:
                     if verbose:
                         print(f"[skip] {p.name}: cannot parse x_y ({e})")
+                    if tile_summary_rows is not None:
+                        append_tile_summary(tile_summary_rows, tile_rel=tile_rel, tile_name=p.name, tile_stem=tile_stem, cell=cell, tile_path_abs=str(p.resolve()), blank_white=blank_white, num_preds=0, min_conf=None, mean_conf=None, max_conf=None, max_area_m2=None, sum_area_m2=0.0, max_mask_area_px=None)
                     continue
 
         if use_geotiff:
-            results = model.predict(
-                source=img,
-                imgsz=imgsz,
-                conf=conf,
-                iou=iou,
-                max_det=max_det,
-                retina_masks=bool(retina_masks),
-                device=device,
-                verbose=False,
-            )
+            results = model.predict(source=img, imgsz=imgsz, conf=conf, iou=iou, max_det=max_det, retina_masks=bool(retina_masks), device=device, verbose=False)
         else:
             if not use_worldfile and z is None:
                 if verbose:
                     print(f"[skip] {p.name}: missing --z for XYZ tiles")
+                if tile_summary_rows is not None:
+                    append_tile_summary(tile_summary_rows, tile_rel=tile_rel, tile_name=p.name, tile_stem=tile_stem, cell=cell, tile_path_abs=str(p.resolve()), blank_white=blank_white, num_preds=0, min_conf=None, mean_conf=None, max_conf=None, max_area_m2=None, sum_area_m2=0.0, max_mask_area_px=None)
                 continue
-            results = model.predict(
-                source=str(p),
-                imgsz=imgsz,
-                conf=conf,
-                iou=iou,
-                max_det=max_det,
-                retina_masks=bool(retina_masks),
-                device=device,
-                verbose=False,
-            )
+            results = model.predict(source=str(p), imgsz=imgsz, conf=conf, iou=iou, max_det=max_det, retina_masks=bool(retina_masks), device=device, verbose=False)
 
         r = results[0]
         if r.masks is None or r.masks.xy is None:
+            if tile_summary_rows is not None:
+                append_tile_summary(tile_summary_rows, tile_rel=tile_rel, tile_name=p.name, tile_stem=tile_stem, cell=cell, tile_path_abs=str(p.resolve()), blank_white=blank_white, num_preds=0, min_conf=None, mean_conf=None, max_conf=None, max_area_m2=None, sum_area_m2=0.0, max_mask_area_px=None)
             continue
 
         stats.tiles_with_masks += 1
@@ -461,6 +497,10 @@ def run_inference(
                 confs = [float(v) for v in r.boxes.conf.tolist()]
         except Exception:
             confs = []
+
+        kept_tile_confs: List[float] = []
+        kept_tile_areas_m2: List[float] = []
+        kept_tile_mask_areas_px: List[float] = []
 
         for idx, poly in enumerate(r.masks.xy):
             poly_xy = [(float(px), float(py)) for px, py in poly]
@@ -501,7 +541,6 @@ def run_inference(
                 for px, py in poly_xy:
                     X, Y = pixel_to_projected(transform, px, py)
                     src_ring.append([float(X), float(Y)])
-                # Convert to EPSG:4326 first as requested
                 src_ring = transform_ring(src_ring, src_crs, "EPSG:4326")
                 src_crs_eff = "EPSG:4326"
             else:
@@ -541,8 +580,17 @@ def run_inference(
             stats.polys_kept += 1
             confidence = confs[idx] if idx < len(confs) else float(conf)
 
+            kept_tile_confs.append(float(confidence))
+            kept_tile_areas_m2.append(float(area_m2))
+            if mask_area_px is not None:
+                kept_tile_mask_areas_px.append(float(mask_area_px))
+
             props = {
                 "tile": p.name,
+                "tile_rel": tile_rel,
+                "tile_stem": tile_stem,
+                "tile_path_abs": str(p.resolve()),
+                "cell": cell,
                 "z": z,
                 "x": x,
                 "y": y,
@@ -550,30 +598,50 @@ def run_inference(
                 "mask_area_px": mask_area_px,
                 "area_m2": area_m2,
                 "confidence": confidence,
+                "blank_white_tile": bool(blank_white),
             }
 
-            features_3857.append(
-                {
-                    "type": "Feature",
-                    "properties": props,
-                    "geometry": {"type": "Polygon", "coordinates": [ring_3857]},
-                }
-            )
-            features_31983.append(
-                {
-                    "type": "Feature",
-                    "properties": props,
-                    "geometry": {"type": "Polygon", "coordinates": [ring_31983]},
-                }
-            )
+            features_3857.append({"type": "Feature", "properties": props, "geometry": {"type": "Polygon", "coordinates": [ring_3857]}})
+            features_31983.append({"type": "Feature", "properties": props, "geometry": {"type": "Polygon", "coordinates": [ring_31983]}})
+
+        if tile_summary_rows is not None:
+            if kept_tile_confs:
+                min_conf = min(kept_tile_confs)
+                mean_conf = float(sum(kept_tile_confs) / len(kept_tile_confs))
+                max_conf = max(kept_tile_confs)
+                max_area_m2 = max(kept_tile_areas_m2)
+                sum_area_m2 = float(sum(kept_tile_areas_m2))
+                max_mask_area_px = max(kept_tile_mask_areas_px) if kept_tile_mask_areas_px else None
+            else:
+                min_conf = None
+                mean_conf = None
+                max_conf = None
+                max_area_m2 = None
+                sum_area_m2 = 0.0
+                max_mask_area_px = None
+
+            append_tile_summary(tile_summary_rows, tile_rel=tile_rel, tile_name=p.name, tile_stem=tile_stem, cell=cell, tile_path_abs=str(p.resolve()), blank_white=blank_white, num_preds=len(kept_tile_confs), min_conf=min_conf, mean_conf=mean_conf, max_conf=max_conf, max_area_m2=max_area_m2, sum_area_m2=sum_area_m2, max_mask_area_px=max_mask_area_px)
 
         if verbose and stats.tiles_processed % 50 == 0:
-            print(
-                f"[progress] tiles={stats.tiles_processed} features={len(features_3857)} "
-                f"tiles_with_masks={stats.tiles_with_masks}"
-            )
+            print(f"[progress] tiles={stats.tiles_processed} features={len(features_3857)} tiles_with_masks={stats.tiles_with_masks}")
 
     return features_3857, features_31983, stats
+
+
+def write_tile_summary_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["tile_rel", "tile", "tile_stem", "cell", "tile_path_abs", "blank_white", "num_preds", "min_conf", "mean_conf", "max_conf", "max_area_m2", "sum_area_m2", "max_mask_area_px"]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def write_tile_summary_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def main() -> None:
@@ -582,6 +650,8 @@ def main() -> None:
     ap.add_argument("--tiles-dir", required=True, type=Path)
     ap.add_argument("--out-geojson", required=True, type=Path)
     ap.add_argument("--out-geojson-3857", type=Path, default=None)
+    ap.add_argument("--out-tile-summary-csv", type=Path, default=None)
+    ap.add_argument("--out-tile-summary-jsonl", type=Path, default=None)
 
     ap.add_argument("--imgsz", type=int, default=1024)
     ap.add_argument("--conf", type=float, default=0.35)
@@ -594,14 +664,10 @@ def main() -> None:
     ap.add_argument("--z", type=int, default=None, help="XYZ zoom (required for non-GeoTIFF tiles)")
     ap.add_argument("--worldfile-crs", type=str, default="EPSG:31983")
     ap.add_argument("--no-recursive", action="store_true", default=False)
+    ap.add_argument("--white-mean-threshold", type=float, default=245.0)
+    ap.add_argument("--white-std-threshold", type=float, default=8.0)
 
-    # Inference knobs
-    ap.add_argument(
-        "--retina-masks",
-        action="store_true",
-        default=True,
-        help="Use retina_masks=True (recommended for clean polygons). Default: on.",
-    )
+    ap.add_argument("--retina-masks", action="store_true", default=True, help="Use retina_masks=True (recommended for clean polygons). Default: on.")
     ap.add_argument("--no-retina-masks", dest="retina_masks", action="store_false", help="Disable retina_masks.")
     ap.add_argument("--max-det", type=int, default=300)
     ap.add_argument("--device", type=str, default=None, help="e.g. 'cpu', '0' for GPU 0")
@@ -609,7 +675,8 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    tiles = iter_images(args.tiles_dir, recursive=not args.no_recursive)
+    tiles_root = args.tiles_dir.resolve()
+    tiles = [p.resolve() for p in iter_images(args.tiles_dir, recursive=not args.no_recursive)]
     if not tiles:
         raise SystemExit(f"No images found in {args.tiles_dir}")
 
@@ -646,8 +713,25 @@ def main() -> None:
         else:
             out_geojson_3857 = args.out_geojson.with_name(args.out_geojson.name + "_3857.geojson")
 
+    out_tile_summary_csv = args.out_tile_summary_csv
+    if out_tile_summary_csv is None:
+        if args.out_geojson.suffix.lower() == ".geojson":
+            out_tile_summary_csv = args.out_geojson.with_name(args.out_geojson.stem + "_tiles.csv")
+        else:
+            out_tile_summary_csv = args.out_geojson.with_name(args.out_geojson.name + "_tiles.csv")
+
+    out_tile_summary_jsonl = args.out_tile_summary_jsonl
+    if out_tile_summary_jsonl is None:
+        if args.out_geojson.suffix.lower() == ".geojson":
+            out_tile_summary_jsonl = args.out_geojson.with_name(args.out_geojson.stem + "_tiles.jsonl")
+        else:
+            out_tile_summary_jsonl = args.out_geojson.with_name(args.out_geojson.name + "_tiles.jsonl")
+
+    tile_summary_rows: List[Dict[str, Any]] = []
+
     features_3857, features_31983, stats = run_inference(
         model_path=args.model,
+        tiles_root=tiles_root,
         tiles=tiles,
         z=args.z,
         imgsz=args.imgsz,
@@ -662,43 +746,40 @@ def main() -> None:
         verbose=args.verbose,
         precision=args.precision,
         worldfile_crs=args.worldfile_crs,
+        tile_summary_rows=tile_summary_rows,
+        white_mean_threshold=args.white_mean_threshold,
+        white_std_threshold=args.white_std_threshold,
     )
 
     def _sort_key(feat: Dict[str, Any]) -> Tuple[str, int]:
         props = feat.get("properties", {})
-        tile = props.get("tile") or ""
+        tile_rel = props.get("tile_rel") or props.get("tile") or ""
         idx = props.get("mask_idx")
         try:
             idx_val = int(idx)
         except Exception:
             idx_val = 0
-        return (tile, idx_val)
+        return (tile_rel, idx_val)
 
     features_3857 = sorted(features_3857, key=_sort_key)
     features_31983 = sorted(features_31983, key=_sort_key)
+    tile_summary_rows = sorted(tile_summary_rows, key=lambda row: row["tile_rel"])
 
-    out_3857 = {
-        "type": "FeatureCollection",
-        "features": features_3857,
-        "crs": {"type": "name", "properties": {"name": "EPSG:3857"}},
-    }
-    out_31983 = {
-        "type": "FeatureCollection",
-        "features": features_31983,
-        "crs": {"type": "name", "properties": {"name": "EPSG:31983"}},
-    }
+    out_3857 = {"type": "FeatureCollection", "features": features_3857, "crs": {"type": "name", "properties": {"name": "EPSG:3857"}}}
+    out_31983 = {"type": "FeatureCollection", "features": features_31983, "crs": {"type": "name", "properties": {"name": "EPSG:31983"}}}
 
     out_geojson_3857.parent.mkdir(parents=True, exist_ok=True)
-    out_geojson_3857.write_text(
-        json.dumps(out_3857, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8"
-    )
+    out_geojson_3857.write_text(json.dumps(out_3857, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8")
     args.out_geojson.parent.mkdir(parents=True, exist_ok=True)
-    args.out_geojson.write_text(
-        json.dumps(out_31983, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8"
-    )
+    args.out_geojson.write_text(json.dumps(out_31983, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8")
+
+    write_tile_summary_csv(out_tile_summary_csv, tile_summary_rows)
+    write_tile_summary_jsonl(out_tile_summary_jsonl, tile_summary_rows)
 
     print("Wrote:", out_geojson_3857)
     print("Wrote:", args.out_geojson)
+    print("Wrote:", out_tile_summary_csv)
+    print("Wrote:", out_tile_summary_jsonl)
     print("Tiles processed:", stats.tiles_processed)
     print("Tiles with masks:", stats.tiles_with_masks)
     print("Polys total:", stats.polys_total)

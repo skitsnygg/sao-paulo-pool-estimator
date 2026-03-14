@@ -34,6 +34,32 @@ PRIORITY_CELLS=(
   "cell_0022_0013"
 )
 
+EXCLUDE_CELLS=(
+  "cell_0004_0006"
+  "cell_0006_0002"
+  "cell_0009_0006"
+  "cell_0018_0002"
+  "cell_0018_0004"
+  "cell_0019_0005"
+  "cell_0021_0015"
+  "cell_0022_0013"
+  "cell_0023_0008"
+  "cell_0024_0014"
+  "cell_0024_0020"
+  "cell_0025_0010"
+  "cell_0026_0005"
+  "cell_0026_0007"
+  "cell_0028_0008"
+  "cell_0029_0017"
+  "cell_0030_0010"
+  "cell_0032_0001"
+  "cell_0033_0001"
+)
+EXCLUDE_CELLS_FILE="$(mktemp)"
+for c in "${EXCLUDE_CELLS[@]}"; do
+  echo "$TILE_BASE/$c" >> "$EXCLUDE_CELLS_FILE"
+done
+
 echo "Repo: $(pwd)"
 echo "Model: $MODEL"
 echo "Tile base: $TILE_BASE"
@@ -59,7 +85,9 @@ RANDOM_CELLS_FILE="$(mktemp)"
 SELECTED_CELLS_FILE="$(mktemp)"
 trap 'rm -f "$ALL_CELLS_FILE" "$RANDOM_CELLS_FILE" "$SELECTED_CELLS_FILE"' EXIT
 
-find "$TILE_BASE" -mindepth 1 -maxdepth 1 -type d -name 'cell_*' | sort > "$ALL_CELLS_FILE"
+find "$TILE_BASE" -mindepth 1 -maxdepth 1 -type d -name 'cell_*' | sort > "$ALL_CELLS_FILE.tmp"
+grep -Fvx -f "$EXCLUDE_CELLS_FILE" "$ALL_CELLS_FILE.tmp" > "$ALL_CELLS_FILE"
+rm -f "$ALL_CELLS_FILE.tmp"
 
 TOTAL_CELLS=$(wc -l < "$ALL_CELLS_FILE" | tr -d ' ')
 if [ "$TOTAL_CELLS" -eq 0 ]; then
@@ -118,7 +146,7 @@ sed 's/^/  /' "$SELECTED_CELLS_FILE"
 echo
 
 PRED_LABEL_ARGS_FILE="$(mktemp)"
-trap 'rm -f "$ALL_CELLS_FILE" "$RANDOM_CELLS_FILE" "$SELECTED_CELLS_FILE" "$PRED_LABEL_ARGS_FILE"' EXIT
+trap 'rm -f "$ALL_CELLS_FILE" "$RANDOM_CELLS_FILE" "$SELECTED_CELLS_FILE" "$PRED_LABEL_ARGS_FILE" "$EXCLUDE_CELLS_FILE"' EXIT
 : > "$PRED_LABEL_ARGS_FILE"
 
 while IFS= read -r CELL_DIR; do

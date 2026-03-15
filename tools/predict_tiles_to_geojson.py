@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -404,6 +405,7 @@ def run_inference(
     tile_summary_rows: Optional[List[Dict[str, Any]]],
     white_mean_threshold: float,
     white_std_threshold: float,
+    progress_every: int,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], InferenceStats]:
     from PIL import Image
 
@@ -412,9 +414,26 @@ def run_inference(
     features_3857: List[Dict[str, Any]] = []
     features_31983: List[Dict[str, Any]] = []
     stats = InferenceStats()
+    total_tiles = len(tiles)
+    started_at = time.monotonic()
 
     for p in tiles:
         stats.tiles_processed += 1
+        should_print_progress = False
+        if verbose and stats.tiles_processed % 50 == 0:
+            should_print_progress = True
+        if progress_every > 0 and stats.tiles_processed % progress_every == 0:
+            should_print_progress = True
+        if should_print_progress:
+            elapsed_s = max(time.monotonic() - started_at, 1.0)
+            rate_tps = stats.tiles_processed / elapsed_s
+            remaining_tiles = max(total_tiles - stats.tiles_processed, 0)
+            eta_min = (remaining_tiles / rate_tps) / 60.0 if rate_tps > 0 else float("inf")
+            print(
+                f"[progress] tiles={stats.tiles_processed}/{total_tiles} "
+                f"features={len(features_3857)} tiles_with_masks={stats.tiles_with_masks} "
+                f"rate_tps={rate_tps:.2f} eta_min={eta_min:.1f}"
+            )
 
         tile_rel, cell, tile_stem = path_parts_info(tiles_root, p)
         blank_white = is_blank_white_tile(p, white_mean_threshold, white_std_threshold)
@@ -622,9 +641,6 @@ def run_inference(
 
             append_tile_summary(tile_summary_rows, tile_rel=tile_rel, tile_name=p.name, tile_stem=tile_stem, cell=cell, tile_path_abs=str(p.resolve()), blank_white=blank_white, num_preds=len(kept_tile_confs), min_conf=min_conf, mean_conf=mean_conf, max_conf=max_conf, max_area_m2=max_area_m2, sum_area_m2=sum_area_m2, max_mask_area_px=max_mask_area_px)
 
-        if verbose and stats.tiles_processed % 50 == 0:
-            print(f"[progress] tiles={stats.tiles_processed} features={len(features_3857)} tiles_with_masks={stats.tiles_with_masks}")
-
     return features_3857, features_31983, stats
 
 
@@ -672,6 +688,7 @@ def main() -> None:
     ap.add_argument("--max-det", type=int, default=300)
     ap.add_argument("--device", type=str, default=None, help="e.g. 'cpu', '0' for GPU 0")
     ap.add_argument("--verbose", action="store_true", default=False)
+    ap.add_argument("--progress-every", type=int, default=500, help="Print progress every N tiles (0 disables)")
 
     args = ap.parse_args()
 
@@ -749,6 +766,7 @@ def main() -> None:
         tile_summary_rows=tile_summary_rows,
         white_mean_threshold=args.white_mean_threshold,
         white_std_threshold=args.white_std_threshold,
+        progress_every=args.progress_every,
     )
 
     def _sort_key(feat: Dict[str, Any]) -> Tuple[str, int]:

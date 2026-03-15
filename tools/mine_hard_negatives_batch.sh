@@ -139,7 +139,6 @@ SELECTED_COUNT=$(wc -l < "$SELECTED_CELLS_FILE" | tr -d ' ')
 if [ "$SELECTED_COUNT" -eq 0 ]; then
   echo "No cells selected."
   exit 1
-fi
 
 echo "Selected $SELECTED_COUNT cells:"
 sed 's/^/  /' "$SELECTED_CELLS_FILE"

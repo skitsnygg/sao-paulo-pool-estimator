@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import shutil
 import tempfile
@@ -54,6 +55,11 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Report what would happen without writing files.",
+    )
+    ap.add_argument(
+        "--allow-cross-split-duplicates",
+        action="store_true",
+        help="Allow importing a stem that already exists in the opposite split.",
     )
     return ap.parse_args()
 
@@ -196,6 +202,8 @@ def mask_to_yolo_segments(mask_path: Path) -> list[str]:
         pts = approx.reshape(-1, 2)
         if len(pts) < 3:
             continue
+        if np.unique(pts, axis=0).shape[0] < 3:
+            continue
 
         coords: list[str] = []
         for x, y in pts:
@@ -203,10 +211,75 @@ def mask_to_yolo_segments(mask_path: Path) -> list[str]:
             yn = min(max(float(y) / h, 0.0), 1.0)
             coords.append(f"{xn:.6f}")
             coords.append(f"{yn:.6f}")
+        if len(coords) < 6 or len(coords) % 2 != 0:
+            continue
 
         lines.append("0 " + " ".join(coords))
 
     return lines
+
+
+def validate_yolo_lines(lines: list[str], class_id: int = 0) -> list[str]:
+    errors: list[str] = []
+    for idx, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line:
+            errors.append(f"line_{idx}:empty")
+            continue
+        parts = line.split()
+        if len(parts) < 7:
+            errors.append(f"line_{idx}:too_few_tokens:{len(parts)}")
+            continue
+
+        try:
+            cls = float(parts[0])
+        except ValueError:
+            errors.append(f"line_{idx}:non_numeric_class")
+            continue
+
+        if not math.isfinite(cls):
+            errors.append(f"line_{idx}:non_finite_class")
+            continue
+        if not cls.is_integer():
+            errors.append(f"line_{idx}:non_integer_class")
+        elif int(cls) != class_id:
+            errors.append(f"line_{idx}:unexpected_class:{int(cls)}")
+
+        coords: list[float] = []
+        bad_coord = False
+        for token in parts[1:]:
+            try:
+                value = float(token)
+            except ValueError:
+                errors.append(f"line_{idx}:non_numeric_coord")
+                bad_coord = True
+                break
+            if not math.isfinite(value):
+                errors.append(f"line_{idx}:non_finite_coord")
+                bad_coord = True
+                break
+            coords.append(value)
+        if bad_coord:
+            continue
+
+        if len(coords) % 2 != 0:
+            errors.append(f"line_{idx}:odd_coord_count:{len(coords)}")
+            continue
+        if len(coords) < 6:
+            errors.append(f"line_{idx}:too_few_points:{len(coords) // 2}")
+        if any(value < 0.0 or value > 1.0 for value in coords):
+            errors.append(f"line_{idx}:coord_out_of_range")
+
+    return errors
+
+
+def find_images_for_stem(images_dir: Path, stem: str) -> list[Path]:
+    matches: list[Path] = []
+    for ext in IMG_EXTS:
+        cand = images_dir / f"{stem}{ext}"
+        if cand.exists():
+            matches.append(cand)
+    return matches
 
 
 def main() -> int:
@@ -251,8 +324,15 @@ def main() -> int:
 
     imported = 0
     skipped_existing = 0
+    skipped_duplicate_entry = 0
     missing_image = 0
     missing_mask = 0
+    cross_split_conflict = 0
+    invalid_generated_label = 0
+    seen_canonical_ids: set[str] = set()
+    other_split = "val" if args.split == "train" else "train"
+    other_img_dir = dataset / "images" / other_split
+    other_lbl_dir = dataset / "labels" / other_split
 
     for idx, zp in enumerate(nested_zips):
         export_dir = nested_dir / f"export_{idx:03d}"
@@ -276,6 +356,11 @@ def main() -> int:
 
         for entry in entries:
             canonical_id = canonical_from_identity(entry)
+            if canonical_id in seen_canonical_ids:
+                skipped_duplicate_entry += 1
+                print(f"Skipping duplicate entry in archive: {canonical_id}")
+                continue
+            seen_canonical_ids.add(canonical_id)
 
             src_img = resolve_source_image(image_root, canonical_id)
             if src_img is None:
@@ -287,6 +372,15 @@ def main() -> int:
             if mask_path is None:
                 missing_mask += 1
                 print(f"Missing mask for: {canonical_id}")
+                continue
+
+            other_images = find_images_for_stem(other_img_dir, canonical_id)
+            other_label = other_lbl_dir / f"{canonical_id}.txt"
+            if (other_images or other_label.exists()) and not args.allow_cross_split_duplicates:
+                cross_split_conflict += 1
+                print(
+                    f"Skipping cross-split conflict ({args.split} vs {other_split}) for: {canonical_id}"
+                )
                 continue
 
             out_img = img_dst / f"{canonical_id}{src_img.suffix.lower()}"
@@ -301,6 +395,11 @@ def main() -> int:
             if not yolo_lines:
                 print(f"Mask had no usable contours: {canonical_id}")
                 continue
+            validation_errors = validate_yolo_lines(yolo_lines, class_id=0)
+            if validation_errors:
+                invalid_generated_label += 1
+                print(f"Invalid generated label for {canonical_id}: {validation_errors[:4]}")
+                continue
 
             if not args.dry_run:
                 shutil.copy2(src_img, out_img)
@@ -312,8 +411,11 @@ def main() -> int:
     print()
     print(f"Imported: {imported}")
     print(f"Skipped existing: {skipped_existing}")
+    print(f"Skipped duplicate entries: {skipped_duplicate_entry}")
     print(f"Missing image: {missing_image}")
     print(f"Missing mask: {missing_mask}")
+    print(f"Cross-split conflicts: {cross_split_conflict}")
+    print(f"Invalid generated labels: {invalid_generated_label}")
     print(f"Dry run: {args.dry_run}")
 
     if cleanup:

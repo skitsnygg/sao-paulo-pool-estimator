@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 Mine candidate hard-negative tiles from YOLO prediction outputs while excluding anything
-already present in existing labeled datasets.
+already present in existing train/val datasets.
 
 What it does
 ------------
-1. Scans one or more existing label roots and builds a conservative "already done" set.
+1. Scans one or more existing label/image roots and builds a conservative "already done" set.
 2. Scans one or more YOLO prediction label roots and keeps only non-empty prediction files.
 3. Resolves each prediction back to its source image from one or more tile roots.
-4. Excludes candidates whose stem / tile id already appears in existing labeled sets.
+4. Excludes candidates whose stem / tile id already appears in existing train/val labels or images.
 5. Copies or symlinks candidates into a review folder with collision-proof filenames.
 6. Writes a manifest CSV and summary JSON.
 
@@ -32,6 +32,11 @@ python tools/mine_hard_negatives.py \
     data/datasets/geosampa_master_2020_with_reviewed_empties_v1_blacklist_pruned/labels/val \
     data/datasets/YOUR_2024_SET/labels/train \
     data/datasets/YOUR_2024_SET/labels/val \
+  --existing-image-roots \
+    data/datasets/geosampa_master_2020_with_reviewed_empties_v1_blacklist_pruned/images/train \
+    data/datasets/geosampa_master_2020_with_reviewed_empties_v1_blacklist_pruned/images/val \
+    data/datasets/YOUR_2024_SET/images/train \
+    data/datasets/YOUR_2024_SET/images/val \
   --prediction-label-roots \
     runs/segment/predict_higienopolis_moemaft_conf015/hig_cell_0026_0007/labels \
     runs/segment/idesp_full_v26_predict_c10/labels \
@@ -85,6 +90,15 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         required=True,
         help="One or more roots containing existing labeled .txt files to exclude.",
+    )
+    p.add_argument(
+        "--existing-image-roots",
+        nargs="*",
+        default=[],
+        help=(
+            "Optional roots containing existing train/val images to exclude. "
+            "If omitted, image roots are inferred from --existing-label-roots by replacing /labels/ with /images/."
+        ),
     )
     p.add_argument(
         "--prediction-label-roots",
@@ -206,11 +220,53 @@ def iter_label_files(root: Path) -> Iterable[Path]:
             yield p
 
 
-def build_existing_sets(label_roots: Sequence[Path]) -> Tuple[Set[str], Set[str], Dict[str, int]]:
+def iter_image_files(root: Path) -> Iterable[Path]:
+    if root.is_file() and root.suffix.lower() in IMAGE_EXTS:
+        yield root
+        return
+    if not root.exists():
+        return
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+            yield p
+
+
+def infer_image_roots_from_label_roots(label_roots: Sequence[Path]) -> List[Path]:
+    inferred: List[Path] = []
+    for root in label_roots:
+        probe = root.parent if root.suffix.lower() == LABEL_EXT else root
+        parts = list(probe.parts)
+        idx = -1
+        for i in range(len(parts) - 1, -1, -1):
+            if parts[i] == "labels":
+                idx = i
+                break
+        if idx < 0:
+            continue
+        out_parts = parts[:]
+        out_parts[idx] = "images"
+        inferred.append(Path(*out_parts))
+    return inferred
+
+
+def unique_paths(paths: Sequence[Path]) -> List[Path]:
+    out: List[Path] = []
+    seen: Set[str] = set()
+    for p in paths:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def build_existing_sets(label_roots: Sequence[Path], image_roots: Sequence[Path]) -> Tuple[Set[str], Set[str], Dict[str, int]]:
     canonical_ids: Set[str] = set()
     stem_only_ids: Set[str] = set()
     stats = {
         "label_files_seen": 0,
+        "image_files_seen": 0,
         "canonical_ids": 0,
         "stem_only_ids": 0,
     }
@@ -218,6 +274,14 @@ def build_existing_sets(label_roots: Sequence[Path]) -> Tuple[Set[str], Set[str]
     for root in label_roots:
         for p in iter_label_files(root):
             stats["label_files_seen"] += 1
+            cid = canonical_tile_id(p)
+            sid = stem_only_from_path(p)
+            canonical_ids.add(cid)
+            stem_only_ids.add(sid)
+
+    for root in image_roots:
+        for p in iter_image_files(root):
+            stats["image_files_seen"] += 1
             cid = canonical_tile_id(p)
             sid = stem_only_from_path(p)
             canonical_ids.add(cid)
@@ -330,6 +394,9 @@ def main() -> int:
     args = parse_args()
 
     existing_label_roots = [Path(x).expanduser().resolve() for x in args.existing_label_roots]
+    user_existing_image_roots = [Path(x).expanduser().resolve() for x in args.existing_image_roots]
+    inferred_existing_image_roots = [p.expanduser().resolve() for p in infer_image_roots_from_label_roots(existing_label_roots)]
+    existing_image_roots = unique_paths([*user_existing_image_roots, *inferred_existing_image_roots])
     prediction_label_roots = [Path(x).expanduser().resolve() for x in args.prediction_label_roots]
     tile_roots = [Path(x).expanduser().resolve() for x in args.tile_roots]
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -340,7 +407,7 @@ def main() -> int:
 
     random.seed(args.seed)
 
-    existing_canonical, existing_stems, existing_stats = build_existing_sets(existing_label_roots)
+    existing_canonical, existing_stems, existing_stats = build_existing_sets(existing_label_roots, existing_image_roots)
     image_by_canonical, images_by_stem, image_stats = build_image_index(tile_roots)
 
     candidates: List[Candidate] = []
@@ -421,6 +488,8 @@ def main() -> int:
 
     summary = {
         "existing_label_roots": [str(p) for p in existing_label_roots],
+        "existing_image_roots": [str(p) for p in existing_image_roots],
+        "inferred_existing_image_roots": [str(p) for p in inferred_existing_image_roots],
         "prediction_label_roots": [str(p) for p in prediction_label_roots],
         "tile_roots": [str(p) for p in tile_roots],
         "out_dir": str(out_dir),

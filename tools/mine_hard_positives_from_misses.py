@@ -30,6 +30,15 @@ def parse_args() -> argparse.Namespace:
         description="Mine hard-positive candidates from images with no prediction label file."
     )
     p.add_argument("--existing-label-roots", nargs="+", required=True)
+    p.add_argument(
+        "--existing-image-roots",
+        nargs="*",
+        default=[],
+        help=(
+            "Optional roots containing existing train/val images to exclude. "
+            "If omitted, image roots are inferred from --existing-label-roots by replacing /labels/ with /images/."
+        ),
+    )
     p.add_argument("--prediction-label-roots", nargs="+", required=True)
     p.add_argument("--tile-roots", nargs="+", required=True)
     p.add_argument("--out-dir", required=True)
@@ -92,14 +101,50 @@ def iter_image_files(root: Path) -> Iterable[Path]:
             yield p
 
 
-def build_existing_sets(label_roots: Sequence[Path]) -> Tuple[Set[str], Set[str], Dict[str, int]]:
+def infer_image_roots_from_label_roots(label_roots: Sequence[Path]) -> List[Path]:
+    inferred: List[Path] = []
+    for root in label_roots:
+        probe = root.parent if root.suffix.lower() == LABEL_EXT else root
+        parts = list(probe.parts)
+        idx = -1
+        for i in range(len(parts) - 1, -1, -1):
+            if parts[i] == "labels":
+                idx = i
+                break
+        if idx < 0:
+            continue
+        out_parts = parts[:]
+        out_parts[idx] = "images"
+        inferred.append(Path(*out_parts))
+    return inferred
+
+
+def unique_paths(paths: Sequence[Path]) -> List[Path]:
+    out: List[Path] = []
+    seen: Set[str] = set()
+    for p in paths:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def build_existing_sets(label_roots: Sequence[Path], image_roots: Sequence[Path]) -> Tuple[Set[str], Set[str], Dict[str, int]]:
     canonical_ids: Set[str] = set()
     stem_only_ids: Set[str] = set()
-    stats = {"label_files_seen": 0, "canonical_ids": 0, "stem_only_ids": 0}
+    stats = {"label_files_seen": 0, "image_files_seen": 0, "canonical_ids": 0, "stem_only_ids": 0}
 
     for root in label_roots:
         for p in iter_label_files(root):
             stats["label_files_seen"] += 1
+            canonical_ids.add(canonical_tile_id(p))
+            stem_only_ids.add(stem_only_from_path(p))
+
+    for root in image_roots:
+        for p in iter_image_files(root):
+            stats["image_files_seen"] += 1
             canonical_ids.add(canonical_tile_id(p))
             stem_only_ids.add(stem_only_from_path(p))
 
@@ -151,6 +196,9 @@ def main() -> int:
     args = parse_args()
 
     existing_label_roots = [Path(x).expanduser().resolve() for x in args.existing_label_roots]
+    user_existing_image_roots = [Path(x).expanduser().resolve() for x in args.existing_image_roots]
+    inferred_existing_image_roots = [p.expanduser().resolve() for p in infer_image_roots_from_label_roots(existing_label_roots)]
+    existing_image_roots = unique_paths([*user_existing_image_roots, *inferred_existing_image_roots])
     prediction_label_roots = [Path(x).expanduser().resolve() for x in args.prediction_label_roots]
     tile_roots = [Path(x).expanduser().resolve() for x in args.tile_roots]
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -160,7 +208,7 @@ def main() -> int:
 
     random.seed(args.seed)
 
-    existing_canonical, existing_stems, existing_stats = build_existing_sets(existing_label_roots)
+    existing_canonical, existing_stems, existing_stats = build_existing_sets(existing_label_roots, existing_image_roots)
     predicted_canonical, pred_stats = build_predicted_set(prediction_label_roots)
     images, image_stats = build_image_index(tile_roots)
 
@@ -214,6 +262,8 @@ def main() -> int:
 
     summary = {
         "existing_label_roots": [str(p) for p in existing_label_roots],
+        "existing_image_roots": [str(p) for p in existing_image_roots],
+        "inferred_existing_image_roots": [str(p) for p in inferred_existing_image_roots],
         "prediction_label_roots": [str(p) for p in prediction_label_roots],
         "tile_roots": [str(p) for p in tile_roots],
         "out_dir": str(out_dir),

@@ -38,6 +38,14 @@ class TileRow:
         return self.num_preds == 0
 
 
+def canonical_tile_id(cell: str, tile_stem: str) -> str:
+    cell_clean = (cell or "").strip()
+    stem_clean = (tile_stem or "").strip()
+    if cell_clean:
+        return f"{cell_clean}__{stem_clean}"
+    return stem_clean
+
+
 def parse_int(value: str, default: int = 0) -> int:
     try:
         return int(value)
@@ -80,6 +88,28 @@ def read_rows(csv_path: Path) -> List[TileRow]:
                 )
             )
     return rows
+
+
+def build_existing_canonical_ids(label_roots: Iterable[Path]) -> Set[str]:
+    existing: Set[str] = set()
+    for root in label_roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*.txt"):
+            if not p.is_file():
+                continue
+            stem = p.stem
+            if "__" in stem:
+                existing.add(stem)
+                continue
+            # Fallback for nested cell/<labels>/<tile>.txt style layouts.
+            cell = ""
+            for part in p.parts:
+                if part.startswith("cell_"):
+                    cell = part
+                    break
+            existing.add(canonical_tile_id(cell, stem))
+    return existing
 
 
 def mirror_copy(src: Path, dst: Path) -> None:
@@ -236,6 +266,14 @@ def main() -> None:
     ap.add_argument("--tiles-root", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument(
+        "--exclude-label-roots",
+        type=Path,
+        nargs="*",
+        default=[],
+        help="Optional YOLO label roots used to exclude already-labeled canonical tile ids.",
+    )
+    ap.add_argument("--dry-run", action="store_true", help="Compute selection and summary without copying files.")
 
     ap.add_argument("--low-conf-count", type=int, default=60)
     ap.add_argument("--large-mask-count", type=int, default=40)
@@ -255,16 +293,19 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    if args.out_dir.exists():
+    if not args.dry_run and args.out_dir.exists():
         if not args.overwrite:
             raise SystemExit(f"out dir exists: {args.out_dir} (use --overwrite)")
         shutil.rmtree(args.out_dir)
 
     rows = read_rows(args.tiles_csv)
     tiles_root = args.tiles_root.resolve()
+    exclude_label_roots = [p.expanduser().resolve() for p in args.exclude_label_roots]
+    existing_canonical_ids = build_existing_canonical_ids(exclude_label_roots)
 
     usable: List[TileRow] = []
     missing_sources = 0
+    excluded_existing_label = 0
     for row in rows:
         src = safe_source_path(tiles_root, row)
         if src is None:
@@ -272,6 +313,11 @@ def main() -> None:
             continue
         if row.blank_white == 1:
             continue
+        if existing_canonical_ids:
+            cid = canonical_tile_id(row.cell, row.tile_stem)
+            if cid in existing_canonical_ids:
+                excluded_existing_label += 1
+                continue
         usable.append(row)
 
     pos_per_cell = cell_positive_counts(usable)
@@ -354,20 +400,24 @@ def main() -> None:
     global_manifest: List[Dict[str, object]] = []
 
     for bucket, picked in buckets.items():
-        bucket_dir = args.out_dir / bucket
         bucket_manifest: List[Dict[str, object]] = []
         for row in picked:
             src = safe_source_path(tiles_root, row)
             if src is None:
                 continue
-            dst = bucket_dir / row.tile_rel
-            mirror_copy(src, dst)
             mr = manifest_row(bucket, row)
             bucket_manifest.append(mr)
             global_manifest.append(mr)
-        write_manifest(bucket_dir / "manifest.csv", bucket_manifest)
+            if args.dry_run:
+                continue
+            bucket_dir = args.out_dir / bucket
+            dst = bucket_dir / row.tile_rel
+            mirror_copy(src, dst)
+        if not args.dry_run:
+            write_manifest((args.out_dir / bucket) / "manifest.csv", bucket_manifest)
 
-    write_manifest(args.out_dir / "manifest.csv", global_manifest)
+    if not args.dry_run:
+        write_manifest(args.out_dir / "manifest.csv", global_manifest)
 
     summary = {
         "tiles_csv": str(args.tiles_csv),
@@ -376,6 +426,9 @@ def main() -> None:
         "rows_total": len(rows),
         "rows_usable_nonwhite_with_sources": len(usable),
         "missing_sources": missing_sources,
+        "excluded_existing_label": excluded_existing_label,
+        "exclude_label_roots": [str(p) for p in exclude_label_roots],
+        "existing_canonical_ids_loaded": len(existing_canonical_ids),
         "positive_tiles_usable": len(positives),
         "empty_tiles_usable": len(empties),
         "candidate_counts": {
@@ -397,20 +450,26 @@ def main() -> None:
             "hard_empty_min_positive_tiles_in_cell": args.hard_empty_min_positive_tiles_in_cell,
             "per_cell_limit": args.per_cell_limit,
             "seed": args.seed,
+            "dry_run": bool(args.dry_run),
         },
     }
 
-    (args.out_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    if args.dry_run:
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+    else:
+        (args.out_dir / "summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     print("usable non-white tiles with sources:", len(usable))
     print("usable positives:", len(positives))
     print("usable empties:", len(empties))
     for bucket, picked in buckets.items():
         print(f"{bucket}: {len(picked)}")
-    print("wrote:", args.out_dir)
+    print("dry_run:", bool(args.dry_run))
+    if not args.dry_run:
+        print("wrote:", args.out_dir)
 
 
 if __name__ == "__main__":

@@ -8,9 +8,16 @@ TILE_BASE="/Users/admin/sao-paulo-pool-estimator/data/raw/geosampa_ortho/sp_city
 PRED_BASE="/Users/admin/sao-paulo-pool-estimator/runs/hardneg_predict"
 OUT_DIR="/Users/admin/sao-paulo-pool-estimator/runs/review/hard_negatives_batch_auto"
 
+CURRENT_DATASET_ROOT="/Users/admin/sao-paulo-pool-estimator/data/datasets/geosampa_master_2020_with_reviewed_empties_v1_blacklist_pruned"
+
 EXISTING_LABEL_ROOTS=(
-  "/Users/admin/sao-paulo-pool-estimator/data/datasets/geosampa_master_2020_with_reviewed_empties_v1_blacklist_pruned/labels/train"
-  "/Users/admin/sao-paulo-pool-estimator/data/datasets/geosampa_master_2020_with_reviewed_empties_v1_blacklist_pruned/labels/val"
+  "$CURRENT_DATASET_ROOT/labels/train"
+  "$CURRENT_DATASET_ROOT/labels/val"
+)
+
+EXISTING_IMAGE_ROOTS=(
+  "$CURRENT_DATASET_ROOT/images/train"
+  "$CURRENT_DATASET_ROOT/images/val"
 )
 
 NUM_CELLS=20
@@ -65,6 +72,7 @@ echo "Model: $MODEL"
 echo "Tile base: $TILE_BASE"
 echo "Prediction base: $PRED_BASE"
 echo "Output dir: $OUT_DIR"
+echo "Current dataset root: $CURRENT_DATASET_ROOT"
 echo
 
 if [ ! -f "$MODEL" ]; then
@@ -139,6 +147,7 @@ SELECTED_COUNT=$(wc -l < "$SELECTED_CELLS_FILE" | tr -d ' ')
 if [ "$SELECTED_COUNT" -eq 0 ]; then
   echo "No cells selected."
   exit 1
+fi
 
 echo "Selected $SELECTED_COUNT cells:"
 sed 's/^/  /' "$SELECTED_CELLS_FILE"
@@ -208,6 +217,11 @@ for p in "${EXISTING_LABEL_ROOTS[@]}"; do
   DRY_RUN_CMD+=( "$p" )
 done
 
+DRY_RUN_CMD+=( --existing-image-roots )
+for p in "${EXISTING_IMAGE_ROOTS[@]}"; do
+  DRY_RUN_CMD+=( "$p" )
+done
+
 DRY_RUN_CMD+=( --prediction-label-roots )
 while IFS= read -r p; do
   [ -n "$p" ] || continue
@@ -239,6 +253,11 @@ if [ "$RUN_EXPORT" -eq 1 ]; then
   )
 
   for p in "${EXISTING_LABEL_ROOTS[@]}"; do
+    EXPORT_CMD+=( "$p" )
+  done
+
+  EXPORT_CMD+=( --existing-image-roots )
+  for p in "${EXISTING_IMAGE_ROOTS[@]}"; do
     EXPORT_CMD+=( "$p" )
   done
 

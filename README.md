@@ -1,209 +1,103 @@
-# São Paulo Pool Estimator
+# Sao Paulo Pool Estimator
 
-YOLOv8 segmentation pipeline for city-scale swimming pool detection in São Paulo.
+YOLOv8 segmentation pipeline for swimming pool detection on Sao Paulo aerial imagery.
 
-## Project Overview
+## Overview
 
-This repository is currently focused on **2020 São Paulo citywide pool detection**.
+- Primary target: `pool` segmentation (`class id = 0`).
+- Main operational code is in `tools/` (most `src/` and `scripts/` code is legacy/auxiliary).
+- Current work mixes:
+  - GeoSampa 2020 citywide tiles
+  - Google z21 tiles (active corrective loop)
+  - IDESP 2023/2024 imagery tooling for recall checks and transfer
+- Typical loop:
+  1. Build/import dataset version
+  2. Train (YOLOv8 seg)
+  3. Run tiled inference to GeoJSON + tile summaries
+  4. Build annotation batches (uncertain/missed/hard-neg/hard-pos/corrective)
+  5. Import reviewed labels and retrain
 
-- Primary imagery for training and citywide inference: `data/raw/geosampa_ortho/sp_city_2020_rebuild_official`
-- Comparison imagery now in use: `data/raw/google/sp_city_2020_rebuild_google_z19`
-- Google z21 rebuild path exists and is being prepared: `data/raw/google/sp_city_2020_rebuild_google_z21`
-- Primary class: `pool` (class id `0`)
-- Main model lineage currently used in full-city runs:
-  - `checkpoints/pools_2020_2024_after_2020_unsure_round1.pt`
-  - `checkpoints/pools_2020_2024_after_missed_round2.pt`
-
-Recent citywide outputs indicate GeoSampa 2020 runs around **~60k** detections depending on threshold
-(e.g., `59,819` at conf `0.12`; `62,289` at conf `0.10`).
-
-## Current Pipeline (Practical)
-
-The active loop is:
-
-1. rebuild/download tiles
-2. run prediction to georeferenced GeoJSON
-3. select uncertain/missed/false-positive candidates
-4. annotate or correct in CVAT
-5. import masks back into YOLO format
-6. merge into a **new** dataset version
-7. audit dataset integrity
-8. retrain
-9. rerun full-city inference and compare
-
-## Repository Structure
+## Repo Layout
 
 ```text
 .
-├── tools/                 # Main operational scripts (rebuild, inference, CVAT prep, merge, audit)
+├── tools/                  # Main operational scripts (dataset, train helpers, inference, annotation, QA)
 ├── data/
-│   ├── raw/               # Source/rebuilt imagery (GeoSampa, Google, IDESP)
-│   └── datasets/          # Versioned YOLO segmentation datasets
-├── checkpoints/           # Named model checkpoints used for training/inference
+│   ├── raw/                # Source imagery (GeoSampa, Google, IDESP)
+│   ├── datasets/           # Versioned YOLO datasets
+│   └── annotations/        # CVAT packaging and exports
 ├── runs/
-│   ├── segment/           # Training runs + full-city inference outputs
-│   └── folium/            # Generated map viewers
-├── docs/                  # Additional notes
-└── src/                   # Legacy/auxiliary modules
+│   ├── segment/            # Training runs + inference artifacts
+│   ├── annotation_batches/ # Targeted/corrective annotation exports
+│   └── folium/             # HTML map outputs
+├── checkpoints/            # Named promoted checkpoints
+├── docs/                   # Pipeline notes (GeoSampa rebuild, inference recipes)
+└── src/                    # Legacy modules
 ```
 
-## Key Scripts
+## Data Sources
 
-- `tools/geosampa_2020_official_pipeline.py`
-  - Official GeoSampa 2020 rebuild/index/coverage pipeline (subcommands).
-- `tools/rebuild_sp_city_geosampa_2020_official.sh`
-  - Convenience wrapper to run a full GeoSampa 2020 city rebuild.
-- `tools/predict_tiles_to_geojson.py`
-  - Core inference script: tile predictions -> GeoJSON (`EPSG:31983` + `EPSG:3857`) + tile summaries + run stats.
-- `tools/prepare_cvat_tiles.py`
-  - Builds deterministic CVAT upload sets with unique filenames and manifests.
-- `tools/geojson_to_coco_cvat.py`
-  - Converts geospatial prediction polygons to COCO polygons in image pixel space for CVAT import.
-- `tools/import_mask_dataset_to_yolo.py`
-  - Converts CVAT segmentation-mask exports back into YOLO segmentation labels.
-- `tools/merge_yolo_datasets.py`
-  - Deterministic multi-dataset merge with collision-safe renaming and merge manifests.
-- `tools/audit_fix_yolo_seg_dataset.py`
-  - Dataset integrity audit (and optional quarantine/smoke check).
-- `tools/select_uncertain_tiles.py`
-  - Samples uncertain predictions (confidence band) for active learning.
-- `tools/select_missed_pool_tiles.py`
-  - Ranks likely missed pools from per-tile prediction summaries.
+### GeoSampa 2020 (primary citywide base)
 
-## Recommended Workflow (Current)
+- Current rebuilt root in repo:
+  - `data/raw/geosampa_ortho/sp_city_2020_rebuild_official`
+- Official rebuild pipeline docs:
+  - `docs/geosampa_2020_official_pipeline.md`
+- Wrapper script:
+  - `tools/rebuild_sp_city_geosampa_2020_official.sh`
 
-### 0) Environment
+Example:
 
 ```bash
-source .venv/bin/activate
-```
-
-### 1) Build/Rebuild imagery
-
-GeoSampa 2020 official rebuild (wrapper):
-
-```bash
-SOURCE_VRT=/path/to/source_ortho_2020.vrt \
+SOURCE_VRT=/abs/path/to/source_ortho_2020.vrt \
 OUT_ROOT=data/raw/geosampa_ortho/sp_city_2020_rebuild_official \
 bash tools/rebuild_sp_city_geosampa_2020_official.sh
 ```
 
-If no VRT exists, set `SOURCES_ROOT` so the script can build one first.
+### Google tiles (current z21 corrective focus)
 
-Google imagery rebuilds are currently maintained under:
+- Active roots:
+  - `data/raw/google/sp_city_2020_rebuild_google_z21`
+  - `data/raw/google/sp_city_2020_rebuild_google_z19` (older comparison runs)
+- Recent inference runs are in `runs/segment/z21_*`.
 
-- `data/raw/google/sp_city_2020_rebuild_google_z19`
-- `data/raw/google/sp_city_2020_rebuild_google_z21` (in progress)
+### IDESP 2023/2024 tooling (still relevant)
 
-### 2) Full-city inference -> GeoJSON
+- Raw imagery root:
+  - `data/raw/idesp_ortho/FEHIDRO_ORTOMOSAICO_IGC_RMSP_2023_2024_3857_jpg`
+- Fetch/missing-tile repair tooling:
+  - `tools/fetch_idesp_wms_tiles.py`
+- Rebalance scripts for IDESP YOLO datasets exist, but are currently hardcoded:
+  - `tools/rebuild_balanced_idesp_dataset.py`
+  - `tools/rebuild_balanced_idesp_dataset_grouped_by_cell.py`
 
-GeoSampa 2020 (example):
+## Dataset Preparation
 
-```bash
-.venv/bin/python tools/predict_tiles_to_geojson.py \
-  --model checkpoints/pools_2020_2024_after_missed_round2.pt \
-  --tiles-dir data/raw/geosampa_ortho/sp_city_2020_rebuild_official \
-  --out-geojson runs/segment/geosampa_2020_full_after_missed_round2_c12/pools_geosampa_2020_full.geojson \
-  --out-geojson-3857 runs/segment/geosampa_2020_full_after_missed_round2_c12/pools_geosampa_2020_full_3857.geojson \
-  --out-tile-summary-csv runs/segment/geosampa_2020_full_after_missed_round2_c12/pools_geosampa_2020_full_tiles.csv \
-  --out-tile-summary-jsonl runs/segment/geosampa_2020_full_after_missed_round2_c12/pools_geosampa_2020_full_tiles.jsonl \
-  --out-stats-json runs/segment/geosampa_2020_full_after_missed_round2_c12/pools_geosampa_2020_full_stats.json \
-  --imgsz 1024 \
-  --conf 0.12 \
-  --iou 0.7 \
-  --min-area-px 120 \
-  --min-mask-area-px 120 \
-  --min-area-m2 4.0 \
-  --worldfile-crs EPSG:31983 \
-  --progress-every 500
-```
+### 1) Build a clean base dataset from CVAT zip exports
 
-Google z19 comparison (example):
+Use when assembling master dataset from nested raw CVAT exports:
 
 ```bash
-.venv/bin/python tools/predict_tiles_to_geojson.py \
-  --model checkpoints/pools_2020_2024_after_missed_round2.pt \
-  --tiles-dir data/raw/google/sp_city_2020_rebuild_google_z19 \
-  --out-geojson runs/segment/google_2020_z19_after_missed_round2_conf25/pools_google_2020_z19.geojson \
-  --out-geojson-3857 runs/segment/google_2020_z19_after_missed_round2_conf25/pools_google_2020_z19_3857.geojson \
-  --out-tile-summary-csv runs/segment/google_2020_z19_after_missed_round2_conf25/pools_google_2020_z19_tiles.csv \
-  --out-tile-summary-jsonl runs/segment/google_2020_z19_after_missed_round2_conf25/pools_google_2020_z19_tiles.jsonl \
-  --out-stats-json runs/segment/google_2020_z19_after_missed_round2_conf25/pools_google_2020_z19_stats.json \
-  --imgsz 1024 \
-  --conf 0.25 \
-  --iou 0.7 \
-  --min-area-px 120 \
-  --min-mask-area-px 120 \
-  --min-area-m2 4.0 \
-  --worldfile-crs EPSG:31983 \
-  --progress-every 500
+.venv/bin/python tools/build_geosampa_master_dataset.py \
+  --archive /abs/path/to/cvat_exports_bundle.zip \
+  --out-dir data/datasets/geosampa_master_2020_plus_2024_v6_clean \
+  --clean-out \
+  --fail-on-suspicious \
+  --fail-on-missing-mask
 ```
 
-### 3) Select active-learning candidates
-
-Uncertain-confidence sampling:
-
-```bash
-.venv/bin/python tools/select_uncertain_tiles.py \
-  --tiles-csv runs/segment/geosampa_2020_full_after_missed_round2_c12/pools_geosampa_2020_full_tiles.csv \
-  --min-conf 0.20 \
-  --max-conf 0.45 \
-  --num-tiles 2000 \
-  --out runs/segment/2020_uncertain_candidates.csv \
-  --seed 42
-```
-
-Likely missed-pool ranking:
-
-```bash
-.venv/bin/python tools/select_missed_pool_tiles.py \
-  --tiles-csv runs/segment/geosampa_2020_full_after_missed_round2_c12/pools_geosampa_2020_full_tiles.csv \
-  --num-tiles 2000 \
-  --out runs/segment/2020_missed_candidates.csv
-```
-
-### 4) Prepare CVAT package (optional pre-annotations included)
-
-Prepare deterministic CVAT image package:
-
-```bash
-.venv/bin/python tools/prepare_cvat_tiles.py \
-  --tiles-root data/raw/geosampa_ortho/sp_city_2020_rebuild_official \
-  --tiles-csv runs/segment/2020_uncertain_candidates.csv \
-  --out-dir data/annotations/2020_uncertain_round2_for_cvat \
-  --max-tiles 2000 \
-  --symlink-images
-```
-
-Convert predicted polygons to COCO for CVAT pre-annotation import:
-
-```bash
-.venv/bin/python tools/geojson_to_coco_cvat.py \
-  --geojson runs/segment/geosampa_2020_full_after_missed_round2_c12/pools_geosampa_2020_full.geojson \
-  --manifest-csv data/annotations/2020_uncertain_round2_for_cvat/manifest.csv \
-  --images-dir data/annotations/2020_uncertain_round2_for_cvat/JPEGImages \
-  --out data/annotations/2020_uncertain_round2_for_cvat/predictions_coco.json \
-  --worldfile-crs EPSG:31983 \
-  --min-confidence 0.25
-```
-
-### 5) Import CVAT mask exports back to YOLO
+### 2) Import mask-based reviewed annotations into YOLO format
 
 ```bash
 .venv/bin/python tools/import_mask_dataset_to_yolo.py \
-  --src data/cvat_exports_2020_fresh/Jardins \
-  --dataset data/datasets/2020_unsure_round1 \
+  --src data/annotations/my_round_export \
+  --dataset data/datasets/geosampa_z21_v1 \
   --split train \
   --class-id 0 \
-  --min-area-px 10 \
   --overwrite
 ```
 
-Repeat per export and split as needed.
-
-### 6) Merge datasets into a new version and audit
-
-Current canonical lineage target: `data/datasets/geosampa_master_2020_plus_2024_v6_rebalanced`
+### 3) Merge dataset versions
 
 ```bash
 .venv/bin/python tools/merge_yolo_datasets.py \
@@ -214,94 +108,235 @@ Current canonical lineage target: `data/datasets/geosampa_master_2020_plus_2024_
   --overwrite
 ```
 
+### 4) Audit before training
+
 ```bash
 .venv/bin/python tools/audit_fix_yolo_seg_dataset.py \
   --dataset data/datasets/geosampa_master_2020_plus_2024_v6_rebalanced \
   --strict
 ```
 
-### 7) Train
+Optional split/content rebalance tools:
+
+- `tools/rebuild_geosampa_split_by_content_v2.py`
+- `tools/rebuild_geosampa_split_by_content_v3.py`
+
+## Training
+
+Primary method is Ultralytics CLI (`segment train`) with dataset YAML under `data/datasets/.../dataset.yaml`.
+
+Example (z21-style finetune on MPS):
 
 ```bash
 .venv/bin/yolo segment train \
   model=checkpoints/pools_2020_2024_after_missed_round2.pt \
-  data=data/datasets/geosampa_master_2020_plus_2024_v6_rebalanced/dataset.yaml \
+  data=data/datasets/geosampa_z21_v1/dataset.yaml \
   imgsz=1024 \
-  epochs=30 \
-  batch=2 \
+  epochs=80 \
+  batch=8 \
   device=mps \
   workers=8 \
-  optimizer=AdamW \
-  lr0=0.0005 \
-  patience=100 \
-  project=runs/segment \
-  name=train_next
+  cache=True \
+  name=z21_finetune_v13
 ```
 
-## Annotation Workflow (CVAT)
+Outputs:
 
-1. Run full-city inference and generate per-tile summary CSV.
-2. Select uncertain/missed candidates using `select_uncertain_tiles.py` and `select_missed_pool_tiles.py`.
-3. Build CVAT upload package with `prepare_cvat_tiles.py` (`manifest.csv` + `manifest.jsonl`).
-4. Optionally import model polygons as COCO using `geojson_to_coco_cvat.py`.
-5. Annotate/correct in CVAT and export segmentation masks.
-6. Import masks back to YOLO with `import_mask_dataset_to_yolo.py`.
-7. Merge and audit before any training.
+- `runs/segment/<name>/weights/best.pt`
+- `runs/segment/<name>/weights/last.pt`
+- `runs/segment/<name>/results.csv`
+- `runs/segment/<name>/args.yaml`
 
-## Dataset Hygiene and Audit Guidance
+Checkpoint handling convention:
 
-- Keep raw imagery read-only (`data/raw/*`).
-- Always produce a **new dataset version directory** when merging or importing.
-- Use `merge_manifest.csv` and `merge_stats.json` from `merge_yolo_datasets.py` to track provenance.
-- Run `audit_fix_yolo_seg_dataset.py --strict` before training.
-- Keep class index stable: `pool = 0`.
-- Confirm `dataset.yaml` points to the intended dataset version before each training run.
+- Promote selected weights into `checkpoints/` with explicit names (for inference reproducibility).
+- Recent example in repo:
+  - `checkpoints/pools_z21_v4_targeted_fix_best.pt`
 
-## GeoSampa vs Google Imagery Notes
-
-- GeoSampa 2020 is currently the most stable source for citywide 2020 inference.
-- Google z19 runs currently show over-detection relative to GeoSampa (example with same checkpoint):
-  - GeoSampa 2020 conf `0.12`: `59,819` features (`runs/segment/geosampa_2020_full_after_missed_round2_c12`)
-  - Google z19 conf `0.25`: `69,935` features (`runs/segment/google_2020_z19_after_missed_round2_conf25`)
-  - Google z19 conf `0.15`: `109,399` features (`runs/segment/google_2020_z19_after_missed_round2_conf15`)
-- Practical implication: Google-specific threshold tuning and hard-negative annotation are required before trusting citywide counts.
-
-## Known Issues / Caveats
-
-- Threshold portability across imagery sources is limited (GeoSampa vs Google behavior differs).
-- CRS discipline matters:
-  - training/inference georeferencing commonly uses `EPSG:31983`
-  - map/export consumers often need `EPSG:3857` or `EPSG:4326`
-- Full polygon Folium maps can become very large and slow to load.
-- Some historical artifacts under `runs/segment/` are experiments; do not treat all run outputs as training-ready data.
-
-## Current Best Practices
-
-- Never train from `runs/segment` directories.
-- Always merge into a **new** dataset version.
-- Always audit merged datasets before training.
-- Clear `train.cache` / `val.cache` after dataset changes.
-- Use `batch=2` on MPS unless you are deliberately testing higher values.
-
-Cache clear example:
+Example promotion:
 
 ```bash
-rm -f data/datasets/geosampa_master_2020_plus_2024_v6_rebalanced/labels/train.cache \
-      data/datasets/geosampa_master_2020_plus_2024_v6_rebalanced/labels/val.cache
+cp runs/segment/<train_run>/weights/best.pt checkpoints/pools_<tag>_best.pt
 ```
 
-## Model Iteration History (Recent)
+## Inference
 
-- **2020 unsure rounds**:
-  - focused on borderline detections and annotation uncertainty cleanup
-  - checkpoint lineage includes `checkpoints/pools_2020_2024_after_2020_unsure_round1.pt`
-- **2020 missed-pool rounds**:
-  - targeted low-prediction neighborhoods and neighbor-ranked candidates
-  - checkpoint lineage includes `checkpoints/pools_2020_2024_after_missed_round2.pt`
-- **Google cleanup direction**:
-  - current z19 inference overfires
-  - next loop is Google-specific false-positive mining + hard-negative annotation + retraining
+### Core script
 
-## License
+- `tools/predict_tiles_to_geojson.py`
 
-No `LICENSE` file is currently present in this repository.
+It writes:
+
+- `*.geojson` in `EPSG:31983`
+- `*_3857.geojson`
+- per-tile summary `*_tiles.csv`
+- per-tile JSONL `*_tiles.jsonl`
+- run stats `*_stats.json`
+
+### Example (Google z21 run layout)
+
+```bash
+.venv/bin/python tools/predict_tiles_to_geojson.py \
+  --model checkpoints/pools_z21_v4_targeted_fix_best.pt \
+  --tiles-dir data/raw/google/sp_city_2020_rebuild_google_z21 \
+  --out-geojson runs/segment/z21_ft_v4_targeted_fix_google_z21_c10_20260330_012450/pools.geojson \
+  --out-geojson-3857 runs/segment/z21_ft_v4_targeted_fix_google_z21_c10_20260330_012450/pools_3857.geojson \
+  --out-tile-summary-csv runs/segment/z21_ft_v4_targeted_fix_google_z21_c10_20260330_012450/pools_tiles.csv \
+  --out-tile-summary-jsonl runs/segment/z21_ft_v4_targeted_fix_google_z21_c10_20260330_012450/pools_tiles.jsonl \
+  --out-stats-json runs/segment/z21_ft_v4_targeted_fix_google_z21_c10_20260330_012450/pools_stats.json \
+  --imgsz 1024 \
+  --conf 0.10 \
+  --iou 0.7 \
+  --min-area-px 120 \
+  --min-mask-area-px 120 \
+  --min-area-m2 6.0 \
+  --worldfile-crs EPSG:31983 \
+  --device mps \
+  --progress-every 500
+```
+
+### Threshold and recall notes
+
+- `--conf`, `--iou`, `--min-area-px`, `--min-mask-area-px`, and `--min-area-m2` are the main precision/recall levers.
+- `--recall-profile-2024` applies recall-first overrides (very low conf, lower area thresholds, higher max-det), intended for 2024 imagery probing.
+- Use `--device mps` on Apple Silicon when available.
+
+### Tile georeferencing expectations
+
+- GeoTIFF tiles: CRS/geotransform read from file.
+- PNG/JPG tiles with worldfiles (`.pgw`, `.jgw`, `.wld`): use `--worldfile-crs` (default `EPSG:31983`).
+- XYZ tiles without worldfiles require `--z`.
+
+## Annotation / Active Learning
+
+### Candidate selection from inference summaries
+
+Uncertain predictions:
+
+```bash
+.venv/bin/python tools/select_uncertain_tiles.py \
+  --tiles-csv runs/segment/<run>/pools_tiles.csv \
+  --min-conf 0.20 \
+  --max-conf 0.45 \
+  --num-tiles 500 \
+  --out runs/segment/<run>/uncertain_candidates.csv
+```
+
+Likely misses:
+
+```bash
+.venv/bin/python tools/select_missed_pool_tiles.py \
+  --tiles-csv runs/segment/<run>/pools_tiles.csv \
+  --num-tiles 500 \
+  --out runs/segment/<run>/missed_candidates.csv
+```
+
+### Build CVAT package + optional pre-annotations
+
+```bash
+.venv/bin/python tools/prepare_cvat_tiles.py \
+  --tiles-root data/raw/google/sp_city_2020_rebuild_google_z21 \
+  --tiles-csv runs/segment/<run>/uncertain_candidates.csv \
+  --out-dir data/annotations/<round_name> \
+  --max-tiles 500
+```
+
+```bash
+.venv/bin/python tools/geojson_to_coco_cvat.py \
+  --geojson runs/segment/<run>/pools.geojson \
+  --manifest-csv data/annotations/<round_name>/manifest.csv \
+  --images-dir data/annotations/<round_name>/JPEGImages \
+  --out data/annotations/<round_name>/predictions_coco.json \
+  --worldfile-crs EPSG:31983 \
+  --min-confidence 0.20
+```
+
+### Hard negative / hard positive mining
+
+- `tools/mine_hard_negatives.py`
+- `tools/mine_hard_positives_from_misses.py`
+
+Example hard-negative mining:
+
+```bash
+.venv/bin/python tools/mine_hard_negatives.py \
+  --existing-label-roots data/datasets/geosampa_z21_v1/labels/train data/datasets/geosampa_z21_v1/labels/val \
+  --prediction-label-roots runs/hardneg_predict/<cell_run>/labels \
+  --tile-roots data/raw/google/sp_city_2020_rebuild_google_z21 \
+  --out-dir runs/review/hard_negatives_z21 \
+  --max-candidates 150
+```
+
+### Targeted/corrective Google z21 batches
+
+- `tools/build_google_z21_targeted_annotation_batch.py`
+  - profiles: `round_next`, `v5_corrective`
+  - output: `runs/annotation_batches/<prefix>_<timestamp>/...`
+
+Example (`v5_corrective`):
+
+```bash
+.venv/bin/python tools/build_google_z21_targeted_annotation_batch.py \
+  --profile v5_corrective \
+  --run-dir runs/segment/z21_ft_v3_real_google_z21_c18_20260328_134904 \
+  --tiles-root data/raw/google/sp_city_2020_rebuild_google_z21 \
+  --batch-prefix google_z21_v5_corrective \
+  --tree-shadows-count 72 \
+  --pool-edge-shadows-count 40 \
+  --clean-positive-anchors-count 24 \
+  --mixed-random-small-count 15
+```
+
+## Evaluation / Comparison
+
+- Run ranking / checkpoint recommendation:
+
+```bash
+.venv/bin/python tools/compare_yolo_runs.py
+```
+
+- A/B tile recall check:
+
+```bash
+.venv/bin/python tools/ab_tile_eval.py \
+  --model checkpoints/pools_z21_v4_targeted_fix_best.pt \
+  --tiles-dir /tmp/tiles_eval \
+  --z 21 \
+  --out-geojson runs/segment/ab_eval/z21_candidate.geojson
+```
+
+- Folium visualization:
+
+```bash
+.venv/bin/python tools/folium_view.py \
+  --tiles-dir data/raw/google/sp_city_2020_rebuild_google_z21 \
+  --name z21_example \
+  --pred-geojson runs/segment/<run>/pools.geojson \
+  --assume-pred-crs EPSG:31983 \
+  --base google_sat
+```
+
+## Common Pitfalls / Notes
+
+- `tools/compare_yolo_runs.py` scans both:
+  - `runs/segment`
+  - `runs/segment/runs/segment`
+  This nested path exists from older batch wrappers (`tools/run_pgw_geojson_batch.sh` defaults can create it).
+
+- Some downstream tools expect strict filenames:
+  - `tools/build_google_z21_targeted_annotation_batch.py` expects `<run-dir>/pools.geojson` and `<run-dir>/tiles.csv` exactly.
+  - If inference wrote `pools_tiles.csv`, rename/symlink it to `tiles.csv` before using that script.
+
+- CRS/worldfile assumptions are strict:
+  - Most pipelines expect `EPSG:31983`.
+  - `build_google_z21_targeted_annotation_batch.py` assumes axis-aligned worldfiles (rotated transforms are skipped).
+
+- Keep raw imagery immutable:
+  - Do not edit `data/raw/*` in place.
+
+- Keep class mapping stable:
+  - `pool = 0`.
+
+- Full polygon Folium maps can be very heavy; use `--centroids` or `--max-features` for faster map loads when needed.
+
+- Legacy code exists in `src/` and `scripts/`; current operational workflow is centered on `tools/`.

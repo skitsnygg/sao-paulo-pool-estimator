@@ -85,3 +85,8 @@ tiles_2017/
 tiles_Orto_PMD_RGB_2017/
 cache/
 .agents/
+artifacts/
+tmp/
+audit_report.csv
+audit_report.json
+AGENTS.md

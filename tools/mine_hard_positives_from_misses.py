@@ -12,9 +12,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from tile_id_guard import collect_tile_ids_from_roots, default_existing_image_roots, extract_tile_id
+
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp")
 LABEL_EXT = ".txt"
 CELL_RE = re.compile(r"cell_\d{4}_\d{4}$")
+DEFAULT_EXIST_TRAIN, DEFAULT_EXIST_VAL = default_existing_image_roots()
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,8 @@ def parse_args() -> argparse.Namespace:
             "If omitted, image roots are inferred from --existing-label-roots by replacing /labels/ with /images/."
         ),
     )
+    p.add_argument("--existing-images-train", default=str(DEFAULT_EXIST_TRAIN))
+    p.add_argument("--existing-images-val", default=str(DEFAULT_EXIST_VAL))
     p.add_argument("--prediction-label-roots", nargs="+", required=True)
     p.add_argument("--tile-roots", nargs="+", required=True)
     p.add_argument("--out-dir", required=True)
@@ -62,13 +67,7 @@ def find_cell_in_path(path: Path) -> Optional[str]:
 
 
 def canonical_tile_id(path: Path) -> str:
-    stem = path.stem
-    if "__" in stem:
-        return stem
-    cell_name = find_cell_in_path(path)
-    if cell_name:
-        return f"{cell_name}__{stem}"
-    return stem
+    return extract_tile_id(path.as_posix()) or ""
 
 
 def stem_only_from_path(path: Path) -> str:
@@ -131,26 +130,11 @@ def unique_paths(paths: Sequence[Path]) -> List[Path]:
     return out
 
 
-def build_existing_sets(label_roots: Sequence[Path], image_roots: Sequence[Path]) -> Tuple[Set[str], Set[str], Dict[str, int]]:
-    canonical_ids: Set[str] = set()
-    stem_only_ids: Set[str] = set()
-    stats = {"label_files_seen": 0, "image_files_seen": 0, "canonical_ids": 0, "stem_only_ids": 0}
-
-    for root in label_roots:
-        for p in iter_label_files(root):
-            stats["label_files_seen"] += 1
-            canonical_ids.add(canonical_tile_id(p))
-            stem_only_ids.add(stem_only_from_path(p))
-
-    for root in image_roots:
-        for p in iter_image_files(root):
-            stats["image_files_seen"] += 1
-            canonical_ids.add(canonical_tile_id(p))
-            stem_only_ids.add(stem_only_from_path(p))
-
-    stats["canonical_ids"] = len(canonical_ids)
-    stats["stem_only_ids"] = len(stem_only_ids)
-    return canonical_ids, stem_only_ids, stats
+def build_existing_sets(label_roots: Sequence[Path], image_roots: Sequence[Path]) -> Tuple[Set[str], Dict[str, int]]:
+    merged_roots = [*label_roots, *image_roots]
+    tile_ids, files_scanned = collect_tile_ids_from_roots(merged_roots)
+    stats = {"roots_scanned": len(merged_roots), "files_scanned": files_scanned, "canonical_ids": len(tile_ids)}
+    return tile_ids, stats
 
 
 def build_predicted_set(prediction_label_roots: Sequence[Path]) -> Tuple[Set[str], Dict[str, int]]:
@@ -160,7 +144,9 @@ def build_predicted_set(prediction_label_roots: Sequence[Path]) -> Tuple[Set[str
     for root in prediction_label_roots:
         for p in iter_label_files(root):
             stats["prediction_labels_seen"] += 1
-            predicted.add(canonical_tile_id(p))
+            cid = canonical_tile_id(p)
+            if cid:
+                predicted.add(cid)
 
     stats["predicted_canonical_ids"] = len(predicted)
     return predicted, stats
@@ -197,8 +183,12 @@ def main() -> int:
 
     existing_label_roots = [Path(x).expanduser().resolve() for x in args.existing_label_roots]
     user_existing_image_roots = [Path(x).expanduser().resolve() for x in args.existing_image_roots]
+    default_existing_roots = [
+        Path(args.existing_images_train).expanduser().resolve(),
+        Path(args.existing_images_val).expanduser().resolve(),
+    ]
     inferred_existing_image_roots = [p.expanduser().resolve() for p in infer_image_roots_from_label_roots(existing_label_roots)]
-    existing_image_roots = unique_paths([*user_existing_image_roots, *inferred_existing_image_roots])
+    existing_image_roots = unique_paths([*default_existing_roots, *user_existing_image_roots, *inferred_existing_image_roots])
     prediction_label_roots = [Path(x).expanduser().resolve() for x in args.prediction_label_roots]
     tile_roots = [Path(x).expanduser().resolve() for x in args.tile_roots]
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -208,7 +198,7 @@ def main() -> int:
 
     random.seed(args.seed)
 
-    existing_canonical, existing_stems, existing_stats = build_existing_sets(existing_label_roots, existing_image_roots)
+    existing_canonical, existing_stats = build_existing_sets(existing_label_roots, existing_image_roots)
     predicted_canonical, pred_stats = build_predicted_set(prediction_label_roots)
     images, image_stats = build_image_index(tile_roots)
 
@@ -216,9 +206,8 @@ def main() -> int:
     skipped = {
         "already_predicted": 0,
         "excluded_existing_canonical": 0,
-        "excluded_existing_stem": 0,
         "duplicate_candidate_out_stem": 0,
-        "missing_cell_context": 0,
+        "invalid_tile_id": 0,
     }
     seen_candidate_out_stems: Set[str] = set()
 
@@ -233,15 +222,15 @@ def main() -> int:
 
         out_stem = canonical_tile_id(img)
         stem_only = stem_only_from_path(img)
+        if not out_stem:
+            skipped["invalid_tile_id"] += 1
+            continue
 
         if out_stem in predicted_canonical:
             skipped["already_predicted"] += 1
             continue
         if out_stem in existing_canonical:
             skipped["excluded_existing_canonical"] += 1
-            continue
-        if stem_only in existing_stems:
-            skipped["excluded_existing_stem"] += 1
             continue
         if out_stem in seen_candidate_out_stems:
             skipped["duplicate_candidate_out_stem"] += 1
@@ -321,6 +310,10 @@ def main() -> int:
     print(f"Wrote review images to: {out_images}")
     print(f"Wrote manifest: {manifest_csv}")
     print(f"Wrote summary: {summary_json}")
+    print(f"total candidates scanned: {image_stats['images_seen']}")
+    print(f"skipped (already labeled): {skipped['excluded_existing_canonical']}")
+    print(f"skipped (duplicate in batch): {skipped['duplicate_candidate_out_stem']}")
+    print(f"final selected count: {len(selected)}")
     print(f"Selected {len(selected)} candidates from {len(candidates)} eligible.")
     return 0
 

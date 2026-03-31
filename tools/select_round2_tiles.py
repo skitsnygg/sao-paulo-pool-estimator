@@ -12,9 +12,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
 
+from tile_id_guard import (
+    canonical_rel_from_tile_id,
+    collect_tile_ids_from_roots,
+    default_existing_image_roots,
+    extract_tile_id_from_row,
+)
+
+DEFAULT_EXIST_TRAIN, DEFAULT_EXIST_VAL = default_existing_image_roots()
+
 
 @dataclass
 class TileRow:
+    tile_id: str
     tile_rel: str
     tile: str
     tile_stem: str
@@ -36,14 +46,6 @@ class TileRow:
     @property
     def is_empty(self) -> bool:
         return self.num_preds == 0
-
-
-def canonical_tile_id(cell: str, tile_stem: str) -> str:
-    cell_clean = (cell or "").strip()
-    stem_clean = (tile_stem or "").strip()
-    if cell_clean:
-        return f"{cell_clean}__{stem_clean}"
-    return stem_clean
 
 
 def parse_int(value: str, default: int = 0) -> int:
@@ -70,8 +72,10 @@ def read_rows(csv_path: Path) -> List[TileRow]:
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for r in reader:
+            tile_id = extract_tile_id_from_row(r) or ""
             rows.append(
                 TileRow(
+                    tile_id=tile_id,
                     tile_rel=r["tile_rel"],
                     tile=r["tile"],
                     tile_stem=r["tile_stem"],
@@ -90,28 +94,6 @@ def read_rows(csv_path: Path) -> List[TileRow]:
     return rows
 
 
-def build_existing_canonical_ids(label_roots: Iterable[Path]) -> Set[str]:
-    existing: Set[str] = set()
-    for root in label_roots:
-        if not root.exists():
-            continue
-        for p in root.rglob("*.txt"):
-            if not p.is_file():
-                continue
-            stem = p.stem
-            if "__" in stem:
-                existing.add(stem)
-                continue
-            # Fallback for nested cell/<labels>/<tile>.txt style layouts.
-            cell = ""
-            for part in p.parts:
-                if part.startswith("cell_"):
-                    cell = part
-                    break
-            existing.add(canonical_tile_id(cell, stem))
-    return existing
-
-
 def mirror_copy(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
@@ -120,6 +102,7 @@ def mirror_copy(src: Path, dst: Path) -> None:
 def manifest_row(bucket: str, row: TileRow) -> Dict[str, object]:
     return {
         "bucket": bucket,
+        "tile_id": row.tile_id,
         "tile_rel": row.tile_rel,
         "cell": row.cell,
         "tile": row.tile,
@@ -140,6 +123,7 @@ def write_manifest(path: Path, rows: List[Dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "bucket",
+        "tile_id",
         "tile_rel",
         "cell",
         "tile",
@@ -180,18 +164,22 @@ def pick_rows(
     ranked: List[TileRow],
     *,
     limit: int,
-    used_tiles: Set[str],
+    used_tile_ids: Set[str],
     per_cell_limit: int,
     used_per_cell: Counter,
+    stats: Dict[str, int],
 ) -> List[TileRow]:
     picked: List[TileRow] = []
     for row in ranked:
-        if row.tile_rel in used_tiles:
+        if not row.tile_id:
+            continue
+        if row.tile_id in used_tile_ids:
+            stats["skipped_duplicate_in_batch"] += 1
             continue
         if per_cell_limit > 0 and used_per_cell[row.cell] >= per_cell_limit:
             continue
         picked.append(row)
-        used_tiles.add(row.tile_rel)
+        used_tile_ids.add(row.tile_id)
         used_per_cell[row.cell] += 1
         if len(picked) >= limit:
             break
@@ -271,8 +259,10 @@ def main() -> None:
         type=Path,
         nargs="*",
         default=[],
-        help="Optional YOLO label roots used to exclude already-labeled canonical tile ids.",
+        help="Optional extra roots scanned for tile IDs to exclude.",
     )
+    ap.add_argument("--existing-images-train", type=Path, default=DEFAULT_EXIST_TRAIN)
+    ap.add_argument("--existing-images-val", type=Path, default=DEFAULT_EXIST_VAL)
     ap.add_argument("--dry-run", action="store_true", help="Compute selection and summary without copying files.")
 
     ap.add_argument("--low-conf-count", type=int, default=60)
@@ -299,13 +289,20 @@ def main() -> None:
         shutil.rmtree(args.out_dir)
 
     rows = read_rows(args.tiles_csv)
+    total_candidates_scanned = len(rows)
     tiles_root = args.tiles_root.resolve()
-    exclude_label_roots = [p.expanduser().resolve() for p in args.exclude_label_roots]
-    existing_canonical_ids = build_existing_canonical_ids(exclude_label_roots)
+    exclude_roots = [p.expanduser().resolve() for p in args.exclude_label_roots]
+    existing_roots = [
+        args.existing_images_train.expanduser().resolve(),
+        args.existing_images_val.expanduser().resolve(),
+        *exclude_roots,
+    ]
+    existing_tile_ids, existing_files_scanned = collect_tile_ids_from_roots(existing_roots)
 
     usable: List[TileRow] = []
     missing_sources = 0
     excluded_existing_label = 0
+    missing_tile_id = 0
     for row in rows:
         src = safe_source_path(tiles_root, row)
         if src is None:
@@ -313,11 +310,12 @@ def main() -> None:
             continue
         if row.blank_white == 1:
             continue
-        if existing_canonical_ids:
-            cid = canonical_tile_id(row.cell, row.tile_stem)
-            if cid in existing_canonical_ids:
-                excluded_existing_label += 1
-                continue
+        if not row.tile_id:
+            missing_tile_id += 1
+            continue
+        if row.tile_id in existing_tile_ids:
+            excluded_existing_label += 1
+            continue
         usable.append(row)
 
     pos_per_cell = cell_positive_counts(usable)
@@ -356,44 +354,50 @@ def main() -> None:
     false_pos_ranked = sort_false_positive_candidates(false_positive_candidates)
     hard_empty_ranked = sort_hard_empty(hard_empty_candidates, pos_per_cell, args.seed)
 
-    used_tiles: Set[str] = set()
+    used_tile_ids: Set[str] = set()
     used_per_cell: Counter = Counter()
+    stats = {"skipped_duplicate_in_batch": 0}
 
     buckets: Dict[str, List[TileRow]] = {
         "low_conf": pick_rows(
             low_conf_ranked,
             limit=args.low_conf_count,
-            used_tiles=used_tiles,
+            used_tile_ids=used_tile_ids,
             per_cell_limit=args.per_cell_limit,
             used_per_cell=used_per_cell,
+            stats=stats,
         ),
         "large_masks": pick_rows(
             large_mask_ranked,
             limit=args.large_mask_count,
-            used_tiles=used_tiles,
+            used_tile_ids=used_tile_ids,
             per_cell_limit=args.per_cell_limit,
             used_per_cell=used_per_cell,
+            stats=stats,
         ),
         "many_preds": pick_rows(
             many_preds_ranked,
             limit=args.many_preds_count,
-            used_tiles=used_tiles,
+            used_tile_ids=used_tile_ids,
             per_cell_limit=args.per_cell_limit,
             used_per_cell=used_per_cell,
+            stats=stats,
         ),
         "false_positive_candidates": pick_rows(
             false_pos_ranked,
             limit=args.false_positive_count,
-            used_tiles=used_tiles,
+            used_tile_ids=used_tile_ids,
             per_cell_limit=args.per_cell_limit,
             used_per_cell=used_per_cell,
+            stats=stats,
         ),
         "hard_empty": pick_rows(
             hard_empty_ranked,
             limit=args.hard_empty_count,
-            used_tiles=used_tiles,
+            used_tile_ids=used_tile_ids,
             per_cell_limit=args.per_cell_limit,
             used_per_cell=used_per_cell,
+            stats=stats,
         ),
     }
 
@@ -411,7 +415,8 @@ def main() -> None:
             if args.dry_run:
                 continue
             bucket_dir = args.out_dir / bucket
-            dst = bucket_dir / row.tile_rel
+            rel_for_dst = canonical_rel_from_tile_id(row.tile_id) or row.tile_rel
+            dst = bucket_dir / rel_for_dst
             mirror_copy(src, dst)
         if not args.dry_run:
             write_manifest((args.out_dir / bucket) / "manifest.csv", bucket_manifest)
@@ -424,13 +429,17 @@ def main() -> None:
         "tiles_root": str(tiles_root),
         "out_dir": str(args.out_dir),
         "rows_total": len(rows),
+        "total_candidates_scanned": total_candidates_scanned,
         "rows_usable_nonwhite_with_sources": len(usable),
         "missing_sources": missing_sources,
+        "missing_tile_id": missing_tile_id,
         "excluded_existing_label": excluded_existing_label,
-        "exclude_label_roots": [str(p) for p in exclude_label_roots],
-        "existing_canonical_ids_loaded": len(existing_canonical_ids),
+        "existing_roots": [str(p) for p in existing_roots],
+        "existing_files_scanned": existing_files_scanned,
+        "existing_tile_ids_loaded": len(existing_tile_ids),
         "positive_tiles_usable": len(positives),
         "empty_tiles_usable": len(empties),
+        "skipped_duplicate_in_batch": stats["skipped_duplicate_in_batch"],
         "candidate_counts": {
             "low_conf": len(low_conf_candidates),
             "large_masks": len(large_mask_candidates),
@@ -463,6 +472,10 @@ def main() -> None:
         )
 
     print("usable non-white tiles with sources:", len(usable))
+    print("total candidates scanned:", total_candidates_scanned)
+    print("skipped (already labeled):", excluded_existing_label)
+    print("skipped (duplicate in batch):", stats["skipped_duplicate_in_batch"])
+    print("final selected count:", sum(len(v) for v in buckets.values()))
     print("usable positives:", len(positives))
     print("usable empties:", len(empties))
     for bucket, picked in buckets.items():

@@ -67,9 +67,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from tile_id_guard import collect_tile_ids_from_roots, default_existing_image_roots, extract_tile_id
+
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp")
 LABEL_EXT = ".txt"
 CELL_RE = re.compile(r"cell_\d{4}_\d{4}$")
+DEFAULT_EXIST_TRAIN, DEFAULT_EXIST_VAL = default_existing_image_roots()
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,8 @@ def parse_args() -> argparse.Namespace:
             "If omitted, image roots are inferred from --existing-label-roots by replacing /labels/ with /images/."
         ),
     )
+    p.add_argument("--existing-images-train", default=str(DEFAULT_EXIST_TRAIN))
+    p.add_argument("--existing-images-val", default=str(DEFAULT_EXIST_VAL))
     p.add_argument(
         "--prediction-label-roots",
         nargs="+",
@@ -186,15 +191,7 @@ def canonical_tile_id(path: Path) -> str:
       /.../cell_0026_0007__r0000_c0008.png -> cell_0026_0007__r0000_c0008
       /.../r0000_c0008.png -> r0000_c0008
     """
-    stem = path.stem
-    if "__" in stem:
-        return stem
-
-    cell_name = find_cell_in_path(path)
-    if cell_name:
-        return f"{cell_name}__{stem}"
-
-    return stem
+    return extract_tile_id(path.as_posix()) or ""
 
 
 
@@ -261,35 +258,15 @@ def unique_paths(paths: Sequence[Path]) -> List[Path]:
     return out
 
 
-def build_existing_sets(label_roots: Sequence[Path], image_roots: Sequence[Path]) -> Tuple[Set[str], Set[str], Dict[str, int]]:
-    canonical_ids: Set[str] = set()
-    stem_only_ids: Set[str] = set()
+def build_existing_sets(label_roots: Sequence[Path], image_roots: Sequence[Path]) -> Tuple[Set[str], Dict[str, int]]:
+    merged_roots = [*label_roots, *image_roots]
+    tile_ids, files_scanned = collect_tile_ids_from_roots(merged_roots)
     stats = {
-        "label_files_seen": 0,
-        "image_files_seen": 0,
-        "canonical_ids": 0,
-        "stem_only_ids": 0,
+        "roots_scanned": len(merged_roots),
+        "files_scanned": files_scanned,
+        "canonical_ids": len(tile_ids),
     }
-
-    for root in label_roots:
-        for p in iter_label_files(root):
-            stats["label_files_seen"] += 1
-            cid = canonical_tile_id(p)
-            sid = stem_only_from_path(p)
-            canonical_ids.add(cid)
-            stem_only_ids.add(sid)
-
-    for root in image_roots:
-        for p in iter_image_files(root):
-            stats["image_files_seen"] += 1
-            cid = canonical_tile_id(p)
-            sid = stem_only_from_path(p)
-            canonical_ids.add(cid)
-            stem_only_ids.add(sid)
-
-    stats["canonical_ids"] = len(canonical_ids)
-    stats["stem_only_ids"] = len(stem_only_ids)
-    return canonical_ids, stem_only_ids, stats
+    return tile_ids, stats
 
 
 def build_image_index(tile_roots: Sequence[Path]) -> Tuple[Dict[str, Path], Dict[str, List[Path]], Dict[str, int]]:
@@ -317,6 +294,8 @@ def build_image_index(tile_roots: Sequence[Path]) -> Tuple[Dict[str, Path], Dict
                 continue
             stats["images_seen"] += 1
             cid = canonical_tile_id(p)
+            if not cid:
+                continue
             sid = stem_only_from_path(p)
             if cid in by_canonical and by_canonical[cid] != p:
                 stats["canonical_collisions"] += 1
@@ -346,23 +325,17 @@ def resolve_source_image(
     """
     Returns:
       (source_image, out_stem, stem_only, cell_name, resolution_mode)
-    resolution_mode is one of: canonical, unique_stem, ambiguous_stem, not_found
+    resolution_mode is one of: canonical, invalid_tile_id, not_found
     """
     cid = canonical_tile_id(pred_label)
     sid = stem_only_from_path(pred_label)
     cell_name = cell_name_from_path(pred_label)
+    if not cid:
+        return None, "", sid, cell_name, "invalid_tile_id"
 
     img = image_by_canonical.get(cid)
     if img is not None:
         return img, cid, sid, cell_name, "canonical"
-
-    matches = images_by_stem.get(sid, [])
-    if len(matches) == 1:
-        img = matches[0]
-        resolved_cid = canonical_tile_id(img)
-        return img, resolved_cid, sid, cell_name_from_path(img), "unique_stem"
-    if len(matches) > 1:
-        return None, cid, sid, cell_name, "ambiguous_stem"
     return None, cid, sid, cell_name, "not_found"
 
 
@@ -395,8 +368,12 @@ def main() -> int:
 
     existing_label_roots = [Path(x).expanduser().resolve() for x in args.existing_label_roots]
     user_existing_image_roots = [Path(x).expanduser().resolve() for x in args.existing_image_roots]
+    default_existing_roots = [
+        Path(args.existing_images_train).expanduser().resolve(),
+        Path(args.existing_images_val).expanduser().resolve(),
+    ]
     inferred_existing_image_roots = [p.expanduser().resolve() for p in infer_image_roots_from_label_roots(existing_label_roots)]
-    existing_image_roots = unique_paths([*user_existing_image_roots, *inferred_existing_image_roots])
+    existing_image_roots = unique_paths([*default_existing_roots, *user_existing_image_roots, *inferred_existing_image_roots])
     prediction_label_roots = [Path(x).expanduser().resolve() for x in args.prediction_label_roots]
     tile_roots = [Path(x).expanduser().resolve() for x in args.tile_roots]
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -407,7 +384,7 @@ def main() -> int:
 
     random.seed(args.seed)
 
-    existing_canonical, existing_stems, existing_stats = build_existing_sets(existing_label_roots, existing_image_roots)
+    existing_canonical, existing_stats = build_existing_sets(existing_label_roots, existing_image_roots)
     image_by_canonical, images_by_stem, image_stats = build_image_index(tile_roots)
 
     candidates: List[Candidate] = []
@@ -415,15 +392,13 @@ def main() -> int:
         "prediction_labels_seen": 0,
         "prediction_labels_empty": 0,
         "excluded_existing_canonical": 0,
-        "excluded_existing_stem": 0,
         "resolve_not_found": 0,
-        "resolve_ambiguous_stem": 0,
+        "resolve_invalid_tile_id": 0,
         "duplicate_candidate_out_stem": 0,
     }
     resolution_counts: Dict[str, int] = {
         "canonical": 0,
-        "unique_stem": 0,
-        "ambiguous_stem": 0,
+        "invalid_tile_id": 0,
         "not_found": 0,
     }
 
@@ -444,19 +419,16 @@ def main() -> int:
             )
             resolution_counts[resolution_mode] += 1
 
+            if resolution_mode == "invalid_tile_id":
+                skipped["resolve_invalid_tile_id"] += 1
+                continue
             if resolution_mode == "not_found":
                 skipped["resolve_not_found"] += 1
-                continue
-            if resolution_mode == "ambiguous_stem":
-                skipped["resolve_ambiguous_stem"] += 1
                 continue
             assert source_image is not None
 
             if out_stem in existing_canonical:
                 skipped["excluded_existing_canonical"] += 1
-                continue
-            if stem_only in existing_stems:
-                skipped["excluded_existing_stem"] += 1
                 continue
             if out_stem in seen_candidate_out_stems:
                 skipped["duplicate_candidate_out_stem"] += 1
@@ -563,6 +535,10 @@ def main() -> int:
     print(f"Wrote review images to: {out_images}")
     print(f"Wrote manifest: {manifest_csv}")
     print(f"Wrote summary: {summary_json}")
+    print(f"total candidates scanned: {skipped['prediction_labels_seen']}")
+    print(f"skipped (already labeled): {skipped['excluded_existing_canonical']}")
+    print(f"skipped (duplicate in batch): {skipped['duplicate_candidate_out_stem']}")
+    print(f"final selected count: {len(selected)}")
     print(f"Selected {len(selected)} candidates from {len(candidates)} eligible.")
     return 0
 

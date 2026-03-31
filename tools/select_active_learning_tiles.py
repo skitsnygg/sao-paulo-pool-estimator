@@ -14,6 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from tile_id_guard import (
+    collect_tile_ids_from_roots,
+    default_existing_image_roots,
+    extract_tile_id,
+)
+
 try:
     from PIL import Image
 except Exception:
@@ -22,6 +28,7 @@ except Exception:
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 BUCKETS = ("empty_preds", "low_conf", "large_masks", "many_preds", "random_diverse")
+DEFAULT_EXIST_TRAIN, DEFAULT_EXIST_VAL = default_existing_image_roots()
 
 
 @dataclass
@@ -33,6 +40,7 @@ class ConfidenceIndex:
 
 @dataclass
 class TileStats:
+    tile_id: str
     rel_path: Path
     abs_path: Path
     label_path: Optional[Path]
@@ -86,6 +94,8 @@ def parse_args() -> argparse.Namespace:
         help="Minimum object count to qualify as many_preds (default: 3).",
     )
     ap.add_argument("--seed", type=int, default=42, help="Random seed for sampling.")
+    ap.add_argument("--existing-images-train", type=Path, default=DEFAULT_EXIST_TRAIN)
+    ap.add_argument("--existing-images-val", type=Path, default=DEFAULT_EXIST_VAL)
     ap.add_argument(
         "--overwrite",
         action="store_true",
@@ -526,16 +536,21 @@ def write_manifest(path: Path, rows: Sequence[Dict[str, object]]) -> None:
 def select_tiles(records: Sequence[TileStats], args: argparse.Namespace) -> Tuple[Dict[str, List[TileStats]], Dict[str, object]]:
     rng = random.Random(args.seed)
     selected: Dict[str, List[TileStats]] = {b: [] for b in BUCKETS}
-    picked_keys: set[str] = set()
+    selected_tile_ids: set[str] = set()
+    skipped_duplicate_in_batch = 0
 
     def not_picked(r: TileStats) -> bool:
-        return rel_key(r.rel_path) not in picked_keys
+        nonlocal skipped_duplicate_in_batch
+        if r.tile_id in selected_tile_ids:
+            skipped_duplicate_in_batch += 1
+            return False
+        return True
 
     # 1) empty_preds
     empty_candidates = [r for r in records if r.num_preds == 0]
     empty_candidates.sort(key=lambda r: rel_key(r.rel_path))
     selected["empty_preds"] = empty_candidates[: args.top_k]
-    picked_keys.update(rel_key(r.rel_path) for r in selected["empty_preds"])
+    selected_tile_ids.update(r.tile_id for r in selected["empty_preds"])
 
     # 2) low_conf
     low_conf_pool = [r for r in records if not_picked(r) and r.num_preds > 0 and r.min_conf is not None]
@@ -546,7 +561,7 @@ def select_tiles(records: Sequence[TileStats], args: argparse.Namespace) -> Tupl
         low_conf_candidates = [r for r in low_conf_pool if r.min_conf is not None and r.min_conf <= low_conf_cutoff]
         low_conf_candidates.sort(key=lambda r: (float(r.min_conf), float(r.mean_conf or 1.0), rel_key(r.rel_path)))
         selected["low_conf"] = low_conf_candidates[: args.top_k]
-        picked_keys.update(rel_key(r.rel_path) for r in selected["low_conf"])
+        selected_tile_ids.update(r.tile_id for r in selected["low_conf"])
 
     # 3) large_masks
     large_pool = [r for r in records if not_picked(r) and r.num_preds > 0]
@@ -555,7 +570,7 @@ def select_tiles(records: Sequence[TileStats], args: argparse.Namespace) -> Tupl
         large_candidates = large_pool
     large_candidates.sort(key=lambda r: (r.total_mask_area_fraction, r.num_preds), reverse=True)
     selected["large_masks"] = large_candidates[: args.top_k]
-    picked_keys.update(rel_key(r.rel_path) for r in selected["large_masks"])
+    selected_tile_ids.update(r.tile_id for r in selected["large_masks"])
 
     # 4) many_preds
     many_pool = [r for r in records if not_picked(r) and r.num_preds >= args.many_preds_min]
@@ -563,18 +578,19 @@ def select_tiles(records: Sequence[TileStats], args: argparse.Namespace) -> Tupl
         many_pool = [r for r in records if not_picked(r) and r.num_preds > 0]
     many_pool.sort(key=lambda r: (r.num_preds, r.total_mask_area_fraction), reverse=True)
     selected["many_preds"] = many_pool[: args.top_k]
-    picked_keys.update(rel_key(r.rel_path) for r in selected["many_preds"])
+    selected_tile_ids.update(r.tile_id for r in selected["many_preds"])
 
     # 5) random_diverse
     random_pool = [r for r in records if not_picked(r)]
     selected["random_diverse"] = diverse_random_sample(random_pool, args.top_k, rng)
-    picked_keys.update(rel_key(r.rel_path) for r in selected["random_diverse"])
+    selected_tile_ids.update(r.tile_id for r in selected["random_diverse"])
 
     meta = {
         "low_conf_cutoff": low_conf_cutoff,
         "low_conf_quantile": args.low_conf_quantile,
         "large_mask_min_fraction": args.large_mask_min_fraction,
         "many_preds_min": args.many_preds_min,
+        "skipped_duplicate_in_batch": skipped_duplicate_in_batch,
     }
     return selected, meta
 
@@ -603,6 +619,11 @@ def main() -> int:
 
     conf_index = load_conf_index(conf_path)
     basename_idx = build_label_basename_index(labels_dir)
+    existing_roots = [
+        args.existing_images_train.expanduser().resolve(),
+        args.existing_images_val.expanduser().resolve(),
+    ]
+    existing_tile_ids, existing_files_scanned = collect_tile_ids_from_roots(existing_roots)
 
     images = sorted(iter_images(tiles_dir))
     if not images:
@@ -611,9 +632,18 @@ def main() -> int:
 
     size_cache: Dict[Path, Tuple[int, int]] = {}
     rows_all: List[TileStats] = []
+    skipped_already_labeled = 0
+    skipped_missing_tile_id = 0
 
     for img in images:
         rel = img.relative_to(tiles_dir)
+        tile_id = extract_tile_id(rel.as_posix()) or extract_tile_id(str(img))
+        if not tile_id:
+            skipped_missing_tile_id += 1
+            continue
+        if tile_id in existing_tile_ids:
+            skipped_already_labeled += 1
+            continue
         label_path = resolve_label_path(labels_dir, rel, basename_idx)
         conf_hint = lookup_conf(conf_index, rel)
         num_preds, confs, total_area = parse_yolo_predictions(
@@ -631,6 +661,7 @@ def main() -> int:
 
         rows_all.append(
             TileStats(
+                tile_id=tile_id,
                 rel_path=rel,
                 abs_path=img,
                 label_path=label_path,
@@ -677,6 +708,13 @@ def main() -> int:
         "copy_images": bool(args.copy_images),
         "top_k": int(args.top_k),
         "total_tiles_scanned": len(rows_all),
+        "total_candidates_scanned": len(images),
+        "existing_tile_ids_loaded": len(existing_tile_ids),
+        "existing_files_scanned": existing_files_scanned,
+        "skipped_already_labeled": skipped_already_labeled,
+        "skipped_missing_tile_id": skipped_missing_tile_id,
+        "skipped_duplicate_in_batch": int(selection_meta.get("skipped_duplicate_in_batch", 0)),
+        "final_selected_count": int(sum(len(v) for v in selected.values())),
         "tiles_with_preds": sum(1 for r in rows_all if r.num_preds > 0),
         "tiles_empty_preds": sum(1 for r in rows_all if r.num_preds == 0),
         "bucket_counts": {k: len(v) for k, v in selected.items()},
@@ -690,6 +728,10 @@ def main() -> int:
     logging.info("Wrote global manifest: %s", out_dir / "manifest.csv")
     logging.info("Wrote summary report: %s", summary_path)
     logging.info("Done.")
+    print(f"total candidates scanned: {len(images)}")
+    print(f"skipped (already labeled): {skipped_already_labeled}")
+    print(f"skipped (duplicate in batch): {int(selection_meta.get('skipped_duplicate_in_batch', 0))}")
+    print(f"final selected count: {int(sum(len(v) for v in selected.values()))}")
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 

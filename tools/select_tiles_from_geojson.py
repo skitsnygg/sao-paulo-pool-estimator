@@ -7,6 +7,16 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Set
 
+from tile_id_guard import (
+    canonical_rel_from_tile_id,
+    collect_tile_ids_from_roots,
+    default_existing_image_roots,
+    extract_tile_id_from_row,
+)
+
+
+DEFAULT_EXIST_TRAIN, DEFAULT_EXIST_VAL = default_existing_image_roots()
+
 
 def read_rows(csv_path: Path) -> List[Dict[str, str]]:
     with csv_path.open(newline="", encoding="utf-8") as f:
@@ -34,16 +44,20 @@ def copy_tile(src: Path, dst: Path) -> None:
 
 def pick_unique(
     rows: List[Dict[str, str]],
-    already_used: Set[str],
+    already_used_tile_ids: Set[str],
     limit: int,
+    stats: Dict[str, int],
 ) -> List[Dict[str, str]]:
     picked: List[Dict[str, str]] = []
     for row in rows:
-        tile_rel = row["tile_rel"]
-        if tile_rel in already_used:
+        tile_id = str(row.get("_tile_id", "")).strip()
+        if not tile_id:
+            continue
+        if tile_id in already_used_tile_ids:
+            stats["skipped_duplicate_in_batch"] += 1
             continue
         picked.append(row)
-        already_used.add(tile_rel)
+        already_used_tile_ids.add(tile_id)
         if len(picked) >= limit:
             break
     return picked
@@ -58,6 +72,7 @@ def write_manifest(path: Path, rows: List[Dict[str, str]]) -> None:
 
     fieldnames = [
         "bucket",
+        "tile_id",
         "tile_rel",
         "cell",
         "tile",
@@ -122,6 +137,18 @@ def main() -> None:
     )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument(
+        "--existing-images-train",
+        type=Path,
+        default=DEFAULT_EXIST_TRAIN,
+        help=f"Existing dataset train images root (default: {DEFAULT_EXIST_TRAIN}).",
+    )
+    ap.add_argument(
+        "--existing-images-val",
+        type=Path,
+        default=DEFAULT_EXIST_VAL,
+        help=f"Existing dataset val images root (default: {DEFAULT_EXIST_VAL}).",
+    )
     args = ap.parse_args()
 
     if args.out_dir.exists():
@@ -130,13 +157,18 @@ def main() -> None:
         shutil.rmtree(args.out_dir)
 
     rows = read_rows(args.tiles_csv)
+    total_candidates_scanned = len(rows)
+    existing_roots = [
+        args.existing_images_train.expanduser().resolve(),
+        args.existing_images_val.expanduser().resolve(),
+    ]
+    existing_tile_ids, existing_files_scanned = collect_tile_ids_from_roots(existing_roots)
+    skipped_already_labeled = 0
+    stats = {"skipped_duplicate_in_batch": 0}
 
     # Filter to non-white positive tiles with real source files.
     usable: List[Dict[str, str]] = []
     for row in rows:
-        tile_rel = row["tile_rel"]
-        src = args.tiles_root / tile_rel
-
         blank_white = as_int(row.get("blank_white", "0"))
         num_preds = as_int(row.get("num_preds", "0"))
 
@@ -144,11 +176,27 @@ def main() -> None:
             continue
         if num_preds <= 0:
             continue
+        tile_id = extract_tile_id_from_row(row)
+        if not tile_id:
+            continue
+        if tile_id in existing_tile_ids:
+            skipped_already_labeled += 1
+            continue
+
+        canonical_rel = canonical_rel_from_tile_id(tile_id) or row.get("tile_rel", "")
+        src = args.tiles_root / canonical_rel
+        if not src.exists():
+            src = args.tiles_root / str(row.get("tile_rel", ""))
+        if not src.exists():
+            tile_path_abs = str(row.get("tile_path_abs", "")).strip()
+            src = Path(tile_path_abs) if tile_path_abs else src
         if not src.exists():
             continue
 
         row = dict(row)
         row["_src"] = str(src)
+        row["_tile_id"] = tile_id
+        row["_tile_rel_canonical"] = canonical_rel
         usable.append(row)
 
     # Buckets
@@ -177,13 +225,13 @@ def main() -> None:
     rng = random.Random(args.seed)
     rng.shuffle(random_candidates)
 
-    used: Set[str] = set()
+    used_tile_ids: Set[str] = set()
 
     buckets = {
-        "low_conf": pick_unique(low_conf_candidates, used, args.low_conf_count),
-        "large_masks": pick_unique(large_mask_candidates, used, args.large_mask_count),
-        "many_preds": pick_unique(many_preds_candidates, used, args.many_preds_count),
-        "random": pick_unique(random_candidates, used, args.random_count),
+        "low_conf": pick_unique(low_conf_candidates, used_tile_ids, args.low_conf_count, stats),
+        "large_masks": pick_unique(large_mask_candidates, used_tile_ids, args.large_mask_count, stats),
+        "many_preds": pick_unique(many_preds_candidates, used_tile_ids, args.many_preds_count, stats),
+        "random": pick_unique(random_candidates, used_tile_ids, args.random_count, stats),
     }
 
     manifest_rows: List[Dict[str, str]] = []
@@ -192,13 +240,15 @@ def main() -> None:
         bucket_dir = args.out_dir / bucket
         for row in picked:
             src = Path(row["_src"])
-            dst = bucket_dir / row["tile_rel"]
+            rel_for_dst = str(row.get("_tile_rel_canonical") or row["tile_rel"])
+            dst = bucket_dir / rel_for_dst
             copy_tile(src, dst)
 
             manifest_rows.append(
                 {
                     "bucket": bucket,
-                    "tile_rel": row["tile_rel"],
+                    "tile_id": row["_tile_id"],
+                    "tile_rel": str(row.get("_tile_rel_canonical") or row["tile_rel"]),
                     "cell": row["cell"],
                     "tile": row["tile"],
                     "tile_path_abs": row["tile_path_abs"],
@@ -216,7 +266,8 @@ def main() -> None:
         write_manifest(bucket_dir / "manifest.csv", [
             {
                 "bucket": bucket,
-                "tile_rel": row["tile_rel"],
+                "tile_id": row["_tile_id"],
+                "tile_rel": str(row.get("_tile_rel_canonical") or row["tile_rel"]),
                 "cell": row["cell"],
                 "tile": row["tile"],
                 "tile_path_abs": row["tile_path_abs"],
@@ -234,6 +285,13 @@ def main() -> None:
 
     write_manifest(args.out_dir / "manifest.csv", manifest_rows)
 
+    final_selected_count = sum(len(v) for v in buckets.values())
+    print("total candidates scanned:", total_candidates_scanned)
+    print("existing tile ids loaded:", len(existing_tile_ids))
+    print("existing files scanned:", existing_files_scanned)
+    print("skipped (already labeled):", skipped_already_labeled)
+    print("skipped (duplicate in batch):", stats["skipped_duplicate_in_batch"])
+    print("final selected count:", final_selected_count)
     print("usable positive tiles:", len(usable))
     for bucket, picked in buckets.items():
         print(f"{bucket}: {len(picked)}")

@@ -10,6 +10,7 @@ YOLOv8 segmentation pipeline for swimming pool detection on Sao Paulo aerial ima
   - GeoSampa 2020 citywide tiles
   - Google z21 tiles (active corrective loop)
   - IDESP 2023/2024 imagery tooling for recall checks and transfer
+- Immediate training dataset: `data/datasets/geosampa_z21_v1`
 - Typical loop:
   1. Build/import dataset version
   2. Train (YOLOv8 seg)
@@ -73,6 +74,8 @@ bash tools/rebuild_sp_city_geosampa_2020_official.sh
 
 ## Dataset Preparation
 
+Current immediate train base is `data/datasets/geosampa_z21_v1`.
+
 ### 1) Build a clean base dataset from CVAT zip exports
 
 Use when assembling master dataset from nested raw CVAT exports:
@@ -102,9 +105,9 @@ Use when assembling master dataset from nested raw CVAT exports:
 ```bash
 .venv/bin/python tools/merge_yolo_datasets.py \
   --input-dirs \
-    data/datasets/geosampa_master_2020_plus_2024_v6_clean \
-    data/datasets/2020_missed_round2 \
-  --out-dir data/datasets/geosampa_master_2020_plus_2024_v6_rebalanced \
+    data/datasets/geosampa_z21_v1 \
+    data/datasets/<new_round_dataset> \
+  --out-dir data/datasets/geosampa_z21_v2 \
   --overwrite
 ```
 
@@ -112,7 +115,7 @@ Use when assembling master dataset from nested raw CVAT exports:
 
 ```bash
 .venv/bin/python tools/audit_fix_yolo_seg_dataset.py \
-  --dataset data/datasets/geosampa_master_2020_plus_2024_v6_rebalanced \
+  --dataset data/datasets/geosampa_z21_v2 \
   --strict
 ```
 

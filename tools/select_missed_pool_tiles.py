@@ -8,14 +8,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from tile_id_guard import collect_tile_ids_from_roots, default_existing_image_roots, extract_tile_id_from_row
+
 TRUTHY = {"1", "true", "t", "yes", "y"}
 NAN_LIKE = {"", "nan", "na", "none", "null"}
 RC_PATTERN = re.compile(r"^r(?P<row>\d+)_c(?P<col>\d+)$")
+DEFAULT_EXIST_TRAIN, DEFAULT_EXIST_VAL = default_existing_image_roots()
 
 
 @dataclass
 class TileRow:
     raw: Dict[str, str]
+    tile_id: str
     tile_rel: str
     cell: str
     tile_stem: str
@@ -50,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tiles-csv", type=Path, required=True, help="Input per-tile CSV.")
     ap.add_argument("--num-tiles", type=int, required=True, help="Number of ranked tiles to select.")
     ap.add_argument("--out", type=Path, required=True, help="Output CSV with selected candidates.")
+    ap.add_argument("--existing-images-train", type=Path, default=DEFAULT_EXIST_TRAIN)
+    ap.add_argument("--existing-images-val", type=Path, default=DEFAULT_EXIST_VAL)
     return ap.parse_args()
 
 
@@ -94,6 +100,7 @@ def load_rows(csv_path: Path) -> Tuple[List[TileRow], List[str]]:
             out.append(
                 TileRow(
                     raw=row,
+                    tile_id=extract_tile_id_from_row(row) or "",
                     tile_rel=str(row.get("tile_rel") or "").strip(),
                     cell=str(row.get("cell") or "").strip(),
                     tile_stem=tile_stem,
@@ -170,7 +177,7 @@ def build_ranked_candidates(rows: Sequence[TileRow]) -> List[RankedCandidate]:
                     na_sum += float(nb.sum_area_m2)
                     if nb.num_preds > 0:
                         np_tiles += 1.0
-        neighbor_cache[row.tile_rel] = (np_sum, na_sum, np_tiles)
+        neighbor_cache[row.tile_id or row.tile_rel] = (np_sum, na_sum, np_tiles)
 
         raw_cell_preds.append(cp)
         raw_cell_area.append(ca)
@@ -187,7 +194,7 @@ def build_ranked_candidates(rows: Sequence[TileRow]) -> List[RankedCandidate]:
 
     ranked: List[RankedCandidate] = []
     for i, row in enumerate(candidates):
-        np_sum, na_sum, np_tiles = neighbor_cache[row.tile_rel]
+        np_sum, na_sum, np_tiles = neighbor_cache[row.tile_id or row.tile_rel]
 
         cell_score = (0.65 * norm_cell_preds[i]) + (0.35 * norm_cell_area[i])
         neighborhood_score = (
@@ -217,7 +224,7 @@ def build_ranked_candidates(rows: Sequence[TileRow]) -> List[RankedCandidate]:
             -c.neighborhood_score,
             -c.cell_score,
             c.tile.num_preds,
-            c.tile.tile_rel,
+            c.tile.tile_id or c.tile.tile_rel,
         )
     )
     return ranked
@@ -237,6 +244,7 @@ def write_selected_csv(
     input_fieldnames: Sequence[str],
 ) -> None:
     extra_fields = [
+        "tile_id",
         "candidate_score",
         "cell_score",
         "neighborhood_score",
@@ -255,6 +263,7 @@ def write_selected_csv(
             row = dict(cand.tile.raw)
             row.update(
                 {
+                    "tile_id": cand.tile.tile_id,
                     "candidate_score": f"{cand.candidate_score:.6f}",
                     "cell_score": f"{cand.cell_score:.6f}",
                     "neighborhood_score": f"{cand.neighborhood_score:.6f}",
@@ -289,11 +298,43 @@ def main() -> None:
         raise SystemExit(f"--tiles-csv not found: {args.tiles_csv}")
 
     rows, input_fieldnames = load_rows(args.tiles_csv)
-    ranked = build_ranked_candidates(rows)
-    selected = ranked[: min(args.num_tiles, len(ranked))]
+    total_candidates_scanned = len(rows)
+    existing_roots = [
+        args.existing_images_train.expanduser().resolve(),
+        args.existing_images_val.expanduser().resolve(),
+    ]
+    existing_tile_ids, _ = collect_tile_ids_from_roots(existing_roots)
+    skipped_already_labeled = 0
+    missing_tile_id = 0
+    filtered_rows: List[TileRow] = []
+    for row in rows:
+        if not row.tile_id:
+            missing_tile_id += 1
+            continue
+        if row.tile_id in existing_tile_ids:
+            skipped_already_labeled += 1
+            continue
+        filtered_rows.append(row)
+
+    ranked = build_ranked_candidates(filtered_rows)
+    selected: List[RankedCandidate] = []
+    selected_tile_ids: set[str] = set()
+    skipped_duplicate_in_batch = 0
+    for cand in ranked:
+        if cand.tile.tile_id in selected_tile_ids:
+            skipped_duplicate_in_batch += 1
+            continue
+        selected_tile_ids.add(cand.tile.tile_id)
+        selected.append(cand)
+        if len(selected) >= args.num_tiles:
+            break
 
     write_selected_csv(args.out, selected, input_fieldnames)
 
+    print(f"total candidates scanned: {total_candidates_scanned}")
+    print(f"skipped (already labeled): {skipped_already_labeled}")
+    print(f"skipped (duplicate in batch): {skipped_duplicate_in_batch}")
+    print(f"final selected count: {len(selected)}")
     print(f"total candidate tiles: {len(ranked)}")
     print(f"selected tiles: {len(selected)}")
     print_top_rows(selected)

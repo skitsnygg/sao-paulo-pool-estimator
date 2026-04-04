@@ -19,6 +19,8 @@ import cv2
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from shapely.geometry import Point, box
+from shapely.geometry.base import BaseGeometry
 
 
 RC_RE = re.compile(r"^r(?P<row>\d+)_c(?P<col>\d+)$")
@@ -52,6 +54,28 @@ V6_BUCKETS = (
     "hard_negatives_blue_roofs",
     "review_mixed_small",
 )
+OVERLAP_AUDIT_COLS = [
+    "group_id",
+    "group_kind",
+    "group_size",
+    "decision",
+    "kept_tile_id",
+    "kept_bucket",
+    "kept_selection_score",
+    "kept_center_score",
+    "kept_visible_area_m2",
+    "kept_visible_coverage",
+    "kept_occlusion_ratio",
+    "kept_confidence",
+    "suppressed_tile_id",
+    "suppressed_bucket",
+    "suppressed_selection_score",
+    "suppressed_center_score",
+    "suppressed_visible_area_m2",
+    "suppressed_visible_coverage",
+    "suppressed_occlusion_ratio",
+    "suppressed_confidence",
+]
 
 
 def bucket_order(profile: str) -> Tuple[str, ...]:
@@ -76,6 +100,13 @@ class CacheBundle:
     world: Dict[str, WorldTransform]
     missed_pool_signal: Dict[str, Dict[str, float]]
     max_image_cache: int = 320
+
+
+@dataclass
+class OverlapSuppressionResult:
+    rows: pd.DataFrame
+    stats: Dict[str, int]
+    audit_rows: pd.DataFrame
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,6 +180,55 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Allow removing an existing output directory if it already exists.",
+    )
+    ap.add_argument(
+        "--suppress-overlap-sites",
+        action="store_true",
+        help="Suppress multi-tile overlap duplicates representing the same real-world pool/site.",
+    )
+    ap.add_argument(
+        "--site-radius-m",
+        type=float,
+        default=15.0,
+        help="Centroid distance threshold (meters) for same-site clustering when geometry is available.",
+    )
+    ap.add_argument(
+        "--site-overlap-iou",
+        type=float,
+        default=0.08,
+        help="Polygon IoU threshold for same-site clustering when geometry is available.",
+    )
+    ap.add_argument(
+        "--site-overlap-small",
+        type=float,
+        default=0.35,
+        help="Intersection/min-area threshold for same-site clustering when geometry is available.",
+    )
+    ap.add_argument(
+        "--tile-neighborhood-radius",
+        type=int,
+        default=1,
+        help="Fallback row/col neighborhood radius (same cell) for clustering when geometry is unavailable.",
+    )
+    ap.add_argument(
+        "--overlap-audit",
+        action="store_true",
+        help="Emit overlap audit report listing kept candidates and suppressed alternates per duplicate group.",
+    )
+    ap.add_argument(
+        "--overlap-audit-out",
+        type=Path,
+        default=None,
+        help="Optional path for overlap audit CSV. Default: inside output batch or beside audited CSV.",
+    )
+    ap.add_argument(
+        "--audit-existing-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Audit an existing candidate batch CSV (e.g., combined_summary.csv) for overlap duplicates. "
+            "Runs audit and exits without rebuilding."
+        ),
     )
     return ap.parse_args()
 
@@ -412,6 +492,17 @@ def parse_rc(tile_stem: str) -> Optional[Tuple[int, int]]:
     return int(m.group("row")), int(m.group("col"))
 
 
+def parse_tile_id_components(tile_id: object) -> Optional[Tuple[str, int, int]]:
+    tid = str(tile_id or "").strip()
+    if not re.fullmatch(TILE_ID_PATTERN, tid):
+        return None
+    cell, stem = tid.split("__", 1)
+    rc = parse_rc(stem)
+    if rc is None:
+        return None
+    return cell, int(rc[0]), int(rc[1])
+
+
 def read_world_transform(pgw_path: Path) -> Optional[WorldTransform]:
     try:
         vals = [float(x.strip()) for x in pgw_path.read_text(encoding="utf-8").splitlines()[:6]]
@@ -432,6 +523,24 @@ def world_to_pixel(x: float, y: float, tr: WorldTransform) -> Tuple[float, float
     col = (float(x) - tr.c) / tr.a
     row = (float(y) - tr.f) / tr.e
     return col, row
+
+
+def tile_bounds_polygon(tile_path_abs: str, cache: CacheBundle) -> Optional[Tuple[BaseGeometry, Point, float]]:
+    img = get_image(tile_path_abs, cache)
+    tr = get_world(tile_path_abs, cache)
+    if img is None or tr is None:
+        return None
+    h, w = img.shape[:2]
+    if h <= 0 or w <= 0:
+        return None
+    xs = [tr.c + tr.a * (-0.5), tr.c + tr.a * (float(w) - 0.5)]
+    ys = [tr.f + tr.e * (-0.5), tr.f + tr.e * (float(h) - 0.5)]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    poly = box(minx, miny, maxx, maxy)
+    center = Point((minx + maxx) * 0.5, (miny + maxy) * 0.5)
+    half_diag = 0.5 * float(math.hypot(maxx - minx, maxy - miny))
+    return poly, center, max(half_diag, 1e-6)
 
 
 def load_tile_csv(path: Path) -> Tuple[pd.DataFrame, Dict[str, object]]:
@@ -1774,12 +1883,557 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
         "nearest_larger_area_m2",
         "larger_neighbor_count",
         "tile_feature_count",
+        "overlap_group_id",
+        "overlap_group_kind",
+        "overlap_group_size",
+        "overlap_group_selected",
+        "overlap_group_alternate_count",
+        "overlap_center_score",
+        "overlap_visible_area_m2",
+        "overlap_visible_coverage",
+        "overlap_occlusion_ratio",
+        "overlap_confidence",
     ]
     out = df.copy()
     for c in cols:
         if c not in out.columns:
             out[c] = ""
     return out[cols]
+
+
+def is_valid_geometry_obj(value: object) -> bool:
+    return isinstance(value, BaseGeometry) and (not value.is_empty)
+
+
+def candidate_confidence_value(row: pd.Series) -> float:
+    for c in ("candidate_feature_conf", "confidence", "max_conf", "mean_conf", "min_conf"):
+        if c not in row.index:
+            continue
+        v = safe_float(row.get(c), default=float("nan"))
+        if math.isfinite(v):
+            return float(v)
+    return 0.0
+
+
+def build_feature_geometry_proxy(features: gpd.GeoDataFrame) -> Dict[str, Dict[str, object]]:
+    if features.empty:
+        return {}
+    work = attach_tile_ids(features.copy())
+    work = work.loc[work["tile_id"].notna()].copy()
+    if work.empty:
+        return {}
+    work["_conf"] = pd.to_numeric(work.get("confidence"), errors="coerce").fillna(-np.inf)
+    work["_geom_area"] = work.geometry.area
+    work = work.sort_values(
+        by=["tile_id", "_conf", "_geom_area"],
+        ascending=[True, False, False],
+        kind="mergesort",
+    )
+    best = work.drop_duplicates(subset=["tile_id"], keep="first")
+    out: Dict[str, Dict[str, object]] = {}
+    for row in best.itertuples(index=False):
+        geom = getattr(row, "geometry", None)
+        if not is_valid_geometry_obj(geom):
+            continue
+        out[str(row.tile_id)] = {
+            "geometry": geom,
+            "centroid_x": safe_float(getattr(row, "centroid_x", geom.centroid.x), default=float(geom.centroid.x)),
+            "centroid_y": safe_float(getattr(row, "centroid_y", geom.centroid.y), default=float(geom.centroid.y)),
+            "confidence": safe_float(getattr(row, "confidence", np.nan), default=float("nan")),
+        }
+    return out
+
+
+def attach_geometry_from_feature_proxy(rows: pd.DataFrame, features: gpd.GeoDataFrame) -> pd.DataFrame:
+    if rows.empty or features.empty:
+        return rows
+    proxy = build_feature_geometry_proxy(features)
+    if not proxy:
+        return rows
+    out = attach_tile_ids(rows.copy())
+    if "geometry" not in out.columns:
+        out["geometry"] = None
+    if "centroid_x" not in out.columns:
+        out["centroid_x"] = np.nan
+    if "centroid_y" not in out.columns:
+        out["centroid_y"] = np.nan
+    if "candidate_feature_conf" not in out.columns:
+        out["candidate_feature_conf"] = np.nan
+
+    for idx, row in out.iterrows():
+        tile_id = str(row.get("tile_id", "")).strip()
+        if not tile_id:
+            continue
+        rec = proxy.get(tile_id)
+        if rec is None:
+            continue
+        if not is_valid_geometry_obj(row.get("geometry")):
+            out.at[idx, "geometry"] = rec["geometry"]
+        cx = safe_float(row.get("centroid_x"), default=float("nan"))
+        cy = safe_float(row.get("centroid_y"), default=float("nan"))
+        if not math.isfinite(cx):
+            out.at[idx, "centroid_x"] = rec["centroid_x"]
+        if not math.isfinite(cy):
+            out.at[idx, "centroid_y"] = rec["centroid_y"]
+        conf = safe_float(row.get("candidate_feature_conf"), default=float("nan"))
+        if not math.isfinite(conf):
+            out.at[idx, "candidate_feature_conf"] = rec["confidence"]
+    return out
+
+
+def build_combined_candidate_rows(selected_frames: Dict[str, pd.DataFrame], active_buckets: Sequence[str]) -> pd.DataFrame:
+    rows: List[pd.DataFrame] = []
+    for bucket in active_buckets:
+        frame = selected_frames.get(bucket, pd.DataFrame()).copy()
+        if frame.empty:
+            continue
+        frame = attach_tile_ids(frame)
+        if "tile_rel" in frame.columns and "tile_id" in frame.columns:
+            fallback_rel = frame["tile_id"].map(lambda x: canonical_tile_rel_from_id(str(x)))
+            frame["tile_rel"] = frame["tile_rel"].where(frame["tile_rel"].notna(), fallback_rel)
+        frame["bucket"] = bucket
+        if "rank" not in frame.columns:
+            frame["rank"] = np.arange(1, len(frame) + 1)
+        if "selection_score" not in frame.columns:
+            frame["selection_score"] = np.nan
+        if "selection_reason" not in frame.columns:
+            frame["selection_reason"] = ""
+        rows.append(frame)
+    if not rows:
+        return pd.DataFrame(columns=["tile_id", "tile_rel", "tile_path_abs", "bucket", "rank", "selection_score", "selection_reason"])
+    return pd.concat(rows, ignore_index=True)
+
+
+def dedupe_candidates_by_tile_id_exact(rows: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    if rows.empty:
+        return rows.copy(), 0
+    work = attach_tile_ids(rows.copy())
+    before = int(len(work))
+    work = work.loc[work["tile_id"].notna()].copy().reset_index(drop=True)
+    if work.empty:
+        return work, before
+    work["_row_order"] = np.arange(len(work))
+    if "selection_score" in work.columns:
+        score = pd.to_numeric(work["selection_score"], errors="coerce")
+        work["_score_sort"] = score.fillna(-np.inf)
+    else:
+        work["_score_sort"] = -np.inf
+    if "max_conf" in work.columns:
+        conf = pd.to_numeric(work["max_conf"], errors="coerce")
+    else:
+        conf = pd.Series(np.nan, index=work.index, dtype=float)
+    work["_conf_sort"] = conf.fillna(-np.inf)
+    work = work.sort_values(
+        by=["tile_id", "_score_sort", "_conf_sort", "_row_order"],
+        ascending=[True, False, False, True],
+        kind="mergesort",
+    )
+    out = work.drop_duplicates(subset=["tile_id"], keep="first").copy().reset_index(drop=True)
+    out = out.drop(columns=["_row_order", "_score_sort", "_conf_sort"], errors="ignore")
+    removed = int(before - len(out))
+    return out, removed
+
+
+def resolve_candidate_tile_path(row: pd.Series, *, tiles_root: Path) -> str:
+    raw = str(row.get("tile_path_abs", "")).strip()
+    if raw and Path(raw).exists():
+        return raw
+    tile_id = str(row.get("tile_id", "")).strip()
+    canonical_rel = canonical_tile_rel_from_id(tile_id)
+    if canonical_rel:
+        p = tiles_root / canonical_rel
+        if p.exists():
+            return str(p)
+    rel = str(row.get("tile_rel", "")).strip()
+    if rel:
+        p = tiles_root / rel
+        if p.exists():
+            return str(p)
+    return raw
+
+
+class UnionFind:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> int:
+        ra = self.find(a)
+        rb = self.find(b)
+        if ra == rb:
+            return ra
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+        return ra
+
+
+def apply_overlap_site_suppression(
+    rows: pd.DataFrame,
+    *,
+    features: gpd.GeoDataFrame,
+    cache: CacheBundle,
+    tiles_root: Path,
+    suppress: bool,
+    site_radius_m: float,
+    site_overlap_iou: float,
+    site_overlap_small: float,
+    tile_neighborhood_radius: int,
+) -> OverlapSuppressionResult:
+    if rows.empty:
+        empty_audit = pd.DataFrame(columns=OVERLAP_AUDIT_COLS)
+        return OverlapSuppressionResult(
+            rows=rows.copy(),
+            stats={
+                "raw_candidates": 0,
+                "after_exact_dedupe": 0,
+                "after_overlap_site_suppression": 0,
+                "final_selected": 0,
+                "multi_tile_duplicate_groups_found": 0,
+                "exact_dedupe_removed": 0,
+                "overlap_suppressed": 0,
+                "final_from_overlap_groups": 0,
+            },
+            audit_rows=empty_audit,
+        )
+
+    raw_candidates = int(len(rows))
+    work, exact_removed = dedupe_candidates_by_tile_id_exact(rows)
+    after_exact = int(len(work))
+    if after_exact <= 0:
+        empty_audit = pd.DataFrame(columns=OVERLAP_AUDIT_COLS)
+        return OverlapSuppressionResult(
+            rows=work,
+            stats={
+                "raw_candidates": raw_candidates,
+                "after_exact_dedupe": 0,
+                "after_overlap_site_suppression": 0,
+                "final_selected": 0,
+                "multi_tile_duplicate_groups_found": 0,
+                "exact_dedupe_removed": int(exact_removed),
+                "overlap_suppressed": 0,
+                "final_from_overlap_groups": 0,
+            },
+            audit_rows=empty_audit,
+        )
+
+    work = attach_geometry_from_feature_proxy(work, features)
+    work = work.reset_index(drop=True)
+
+    n = len(work)
+    uf = UnionFind(n)
+    edge_reasons: List[Tuple[int, int, str]] = []
+    tile_ids = [str(work.iloc[i].get("tile_id", "")).strip() for i in range(n)]
+    buckets = [str(work.iloc[i].get("bucket", "")).strip() for i in range(n)]
+    if "selection_score" in work.columns:
+        selection_scores = pd.to_numeric(work["selection_score"], errors="coerce").fillna(-np.inf).to_numpy()
+    else:
+        selection_scores = np.full(n, -np.inf, dtype=float)
+    conf_vals = np.array([candidate_confidence_value(work.iloc[i]) for i in range(n)], dtype=float)
+
+    geoms: List[Optional[BaseGeometry]] = []
+    geom_ok: List[bool] = []
+    centroids: List[Optional[Point]] = []
+    for i in range(n):
+        g = work.iloc[i].get("geometry") if "geometry" in work.columns else None
+        ok = is_valid_geometry_obj(g)
+        geoms.append(g if ok else None)
+        geom_ok.append(ok)
+        centroids.append(g.centroid if ok else None)
+
+    center_scores = np.full(n, -1.0, dtype=float)
+    visible_area = np.zeros(n, dtype=float)
+    visible_cov = np.zeros(n, dtype=float)
+    occlusion_ratio = np.ones(n, dtype=float)
+    tile_cells: List[str] = [""] * n
+    tile_rows: List[Optional[int]] = [None] * n
+    tile_cols: List[Optional[int]] = [None] * n
+
+    tile_ctx_cache: Dict[str, Optional[Tuple[BaseGeometry, Point, float]]] = {}
+    for i in range(n):
+        row = work.iloc[i]
+        tile_id = tile_ids[i]
+        parts = parse_tile_id_components(tile_id)
+        if parts is not None:
+            cell, rr, cc = parts
+            tile_cells[i] = cell
+            tile_rows[i] = rr
+            tile_cols[i] = cc
+        else:
+            tile_cells[i] = str(row.get("cell", "")).strip()
+            rc = parse_rc(str(row.get("tile_stem", "")).strip())
+            if rc is not None:
+                tile_rows[i] = int(rc[0])
+                tile_cols[i] = int(rc[1])
+
+        ctx = tile_ctx_cache.get(tile_id)
+        if tile_id not in tile_ctx_cache:
+            tile_path = resolve_candidate_tile_path(row, tiles_root=tiles_root)
+            ctx = tile_bounds_polygon(tile_path, cache) if tile_path else None
+            tile_ctx_cache[tile_id] = ctx
+        if ctx is None:
+            continue
+        bounds_poly, center_pt, half_diag = ctx
+        geom = geoms[i]
+        if geom is not None:
+            centroid = centroids[i] if centroids[i] is not None else geom.centroid
+            dist = float(centroid.distance(center_pt))
+            center_scores[i] = clamp01(1.0 - (dist / max(half_diag, 1e-6)))
+            inter_area = float(geom.intersection(bounds_poly).area) if geom.intersects(bounds_poly) else 0.0
+            g_area = max(float(geom.area), 1e-6)
+            visible_area[i] = max(0.0, inter_area)
+            visible_cov[i] = clamp01(inter_area / g_area)
+            occlusion_ratio[i] = clamp01(1.0 - visible_cov[i])
+            continue
+        cx = safe_float(row.get("centroid_x"), default=float("nan"))
+        cy = safe_float(row.get("centroid_y"), default=float("nan"))
+        if math.isfinite(cx) and math.isfinite(cy):
+            dist = float(Point(cx, cy).distance(center_pt))
+            center_scores[i] = clamp01(1.0 - (dist / max(half_diag, 1e-6)))
+
+    radius_m = max(0.0, float(site_radius_m))
+    overlap_iou_thr = max(0.0, float(site_overlap_iou))
+    overlap_small_thr = max(0.0, float(site_overlap_small))
+    nb_radius = max(0, int(tile_neighborhood_radius))
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not tile_ids[i] or not tile_ids[j] or tile_ids[i] == tile_ids[j]:
+                continue
+            reason: Optional[str] = None
+            if geom_ok[i] and geom_ok[j]:
+                ci = centroids[i] if centroids[i] is not None else geoms[i].centroid
+                cj = centroids[j] if centroids[j] is not None else geoms[j].centroid
+                if float(ci.distance(cj)) <= radius_m:
+                    reason = "geometry_centroid"
+                else:
+                    gi = geoms[i]
+                    gj = geoms[j]
+                    inter_area = float(gi.intersection(gj).area) if gi.intersects(gj) else 0.0
+                    if inter_area > 0.0:
+                        ai = max(float(gi.area), 1e-6)
+                        aj = max(float(gj.area), 1e-6)
+                        iou = inter_area / max(ai + aj - inter_area, 1e-6)
+                        overlap_small = inter_area / max(min(ai, aj), 1e-6)
+                        if (iou >= overlap_iou_thr) or (overlap_small >= overlap_small_thr):
+                            reason = "geometry_overlap"
+            if reason is None and nb_radius > 0:
+                if tile_cells[i] and tile_cells[i] == tile_cells[j]:
+                    ri, ci = tile_rows[i], tile_cols[i]
+                    rj, cj = tile_rows[j], tile_cols[j]
+                    if (ri is not None) and (ci is not None) and (rj is not None) and (cj is not None):
+                        if abs(int(ri) - int(rj)) <= nb_radius and abs(int(ci) - int(cj)) <= nb_radius:
+                            reason = "tile_neighborhood"
+            if reason is None:
+                continue
+            uf.union(i, j)
+            edge_reasons.append((i, j, reason))
+
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for idx in range(n):
+        groups[uf.find(idx)].append(idx)
+    reasons_by_root: Dict[int, set[str]] = defaultdict(set)
+    for i, _, reason in edge_reasons:
+        reasons_by_root[uf.find(i)].add(reason)
+
+    work["overlap_group_id"] = ""
+    work["overlap_group_kind"] = ""
+    work["overlap_group_size"] = 0
+    work["overlap_group_selected"] = 0
+    work["overlap_group_alternate_count"] = 0
+    work["overlap_center_score"] = np.where(center_scores >= 0.0, center_scores, np.nan)
+    work["overlap_visible_area_m2"] = visible_area
+    work["overlap_visible_coverage"] = visible_cov
+    work["overlap_occlusion_ratio"] = occlusion_ratio
+    work["overlap_confidence"] = conf_vals
+
+    keep_mask = np.ones(n, dtype=bool)
+    duplicate_groups = 0
+    kept_from_overlap_groups = 0
+    audit_entries: List[Dict[str, object]] = []
+
+    for root, idxs in sorted(groups.items(), key=lambda kv: min(kv[1])):
+        unique_tile_ids = sorted({tile_ids[i] for i in idxs if tile_ids[i]})
+        if len(unique_tile_ids) <= 1:
+            continue
+        duplicate_groups += 1
+        group_id = f"site_{duplicate_groups:04d}"
+        reasons = reasons_by_root.get(root, set())
+        group_kind = "geometry" if any(r.startswith("geometry_") for r in reasons) else "tile_neighborhood"
+
+        def rank_key(k: int) -> Tuple[float, float, float, float, float, float, str]:
+            return (
+                -safe_float(center_scores[k], default=-1.0),
+                -safe_float(visible_area[k], default=0.0),
+                -safe_float(visible_cov[k], default=0.0),
+                safe_float(occlusion_ratio[k], default=1.0),
+                -safe_float(conf_vals[k], default=0.0),
+                -safe_float(selection_scores[k], default=-np.inf),
+                tile_ids[k],
+            )
+
+        winner = min(idxs, key=rank_key)
+        kept_from_overlap_groups += 1
+        group_size = int(len(unique_tile_ids))
+
+        for k in idxs:
+            work.at[k, "overlap_group_id"] = group_id
+            work.at[k, "overlap_group_kind"] = group_kind
+            work.at[k, "overlap_group_size"] = group_size
+            work.at[k, "overlap_group_selected"] = 1 if k == winner else 0
+            work.at[k, "overlap_group_alternate_count"] = max(0, group_size - 1)
+            if suppress and k != winner:
+                keep_mask[k] = False
+
+        for k in idxs:
+            if k == winner:
+                continue
+            audit_entries.append(
+                {
+                    "group_id": group_id,
+                    "group_kind": group_kind,
+                    "group_size": group_size,
+                    "decision": "suppressed" if suppress else "would_suppress",
+                    "kept_tile_id": tile_ids[winner],
+                    "kept_bucket": buckets[winner],
+                    "kept_selection_score": safe_float(selection_scores[winner], default=np.nan),
+                    "kept_center_score": safe_float(center_scores[winner], default=np.nan),
+                    "kept_visible_area_m2": safe_float(visible_area[winner], default=np.nan),
+                    "kept_visible_coverage": safe_float(visible_cov[winner], default=np.nan),
+                    "kept_occlusion_ratio": safe_float(occlusion_ratio[winner], default=np.nan),
+                    "kept_confidence": safe_float(conf_vals[winner], default=np.nan),
+                    "suppressed_tile_id": tile_ids[k],
+                    "suppressed_bucket": buckets[k],
+                    "suppressed_selection_score": safe_float(selection_scores[k], default=np.nan),
+                    "suppressed_center_score": safe_float(center_scores[k], default=np.nan),
+                    "suppressed_visible_area_m2": safe_float(visible_area[k], default=np.nan),
+                    "suppressed_visible_coverage": safe_float(visible_cov[k], default=np.nan),
+                    "suppressed_occlusion_ratio": safe_float(occlusion_ratio[k], default=np.nan),
+                    "suppressed_confidence": safe_float(conf_vals[k], default=np.nan),
+                }
+            )
+
+    final_rows = work.loc[keep_mask].copy().reset_index(drop=True) if suppress else work.copy().reset_index(drop=True)
+    after_overlap = int(len(final_rows))
+    overlap_suppressed = int(after_exact - after_overlap) if suppress else 0
+
+    audit_df = pd.DataFrame(audit_entries, columns=OVERLAP_AUDIT_COLS)
+    stats = {
+        "raw_candidates": raw_candidates,
+        "after_exact_dedupe": after_exact,
+        "after_overlap_site_suppression": after_overlap,
+        "final_selected": after_overlap,
+        "multi_tile_duplicate_groups_found": int(duplicate_groups),
+        "exact_dedupe_removed": int(exact_removed),
+        "overlap_suppressed": int(overlap_suppressed),
+        "final_from_overlap_groups": int(
+            final_rows["overlap_group_id"].astype(str).str.strip().ne("").sum() if "overlap_group_id" in final_rows.columns else 0
+        ),
+    }
+    return OverlapSuppressionResult(rows=final_rows, stats=stats, audit_rows=audit_df)
+
+
+def redistribute_combined_rows_by_bucket(combined_rows: pd.DataFrame, active_buckets: Sequence[str]) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    for bucket in active_buckets:
+        frame = combined_rows[combined_rows["bucket"] == bucket].copy() if ("bucket" in combined_rows.columns) else pd.DataFrame()
+        if frame.empty:
+            out[bucket] = frame
+            continue
+        if "selection_score" in frame.columns:
+            score = pd.to_numeric(frame["selection_score"], errors="coerce").fillna(-np.inf)
+        else:
+            score = pd.Series(-np.inf, index=frame.index, dtype=float)
+        frame["_score_sort"] = score
+        frame = frame.sort_values(by=["_score_sort"], ascending=False, kind="mergesort").drop(columns=["_score_sort"])
+        frame = frame.reset_index(drop=True)
+        frame["rank"] = np.arange(1, len(frame) + 1)
+        out[bucket] = frame
+    return out
+
+
+def resolve_overlap_audit_out_path(
+    *,
+    out_dir: Optional[Path],
+    fallback_csv: Optional[Path],
+    override: Optional[Path],
+) -> Path:
+    if override is not None:
+        return override.expanduser().resolve()
+    if out_dir is not None:
+        return (out_dir / "overlap_audit.csv").resolve()
+    if fallback_csv is not None:
+        stem = fallback_csv.stem
+        return fallback_csv.with_name(f"{stem}_overlap_audit.csv").resolve()
+    return Path("overlap_audit.csv").resolve()
+
+
+def run_existing_batch_overlap_audit(
+    *,
+    args: argparse.Namespace,
+    audit_csv_path: Path,
+    tiles_df: pd.DataFrame,
+    features: gpd.GeoDataFrame,
+    cache: CacheBundle,
+    tiles_root: Path,
+) -> None:
+    src = audit_csv_path.expanduser().resolve()
+    if not src.exists():
+        raise SystemExit(f"--audit-existing-csv not found: {src}")
+    candidates = pd.read_csv(src)
+    if candidates.empty:
+        raise SystemExit(f"Audit CSV is empty: {src}")
+    candidates = attach_tile_ids(candidates)
+    candidates = enrich_from_tiles(candidates, tiles_df)
+    if "bucket" not in candidates.columns:
+        candidates["bucket"] = "audit_input"
+    if "selection_score" not in candidates.columns:
+        candidates["selection_score"] = np.nan
+    if "selection_reason" not in candidates.columns:
+        candidates["selection_reason"] = "loaded_from_audit_existing_csv"
+
+    result = apply_overlap_site_suppression(
+        candidates,
+        features=features,
+        cache=cache,
+        tiles_root=tiles_root,
+        suppress=bool(args.suppress_overlap_sites),
+        site_radius_m=float(args.site_radius_m),
+        site_overlap_iou=float(args.site_overlap_iou),
+        site_overlap_small=float(args.site_overlap_small),
+        tile_neighborhood_radius=int(args.tile_neighborhood_radius),
+    )
+
+    audit_path = resolve_overlap_audit_out_path(
+        out_dir=None,
+        fallback_csv=src,
+        override=args.overlap_audit_out,
+    )
+    write_csv(audit_path, result.audit_rows if not result.audit_rows.empty else pd.DataFrame(columns=OVERLAP_AUDIT_COLS))
+
+    print("Overlap audit mode (existing batch)")
+    print(f"source_csv: {src}")
+    print(f"raw candidates: {result.stats.get('raw_candidates', 0)}")
+    print(f"after exact dedupe: {result.stats.get('after_exact_dedupe', 0)}")
+    print(f"after overlap/site suppression: {result.stats.get('after_overlap_site_suppression', 0)}")
+    print(f"final selected: {result.stats.get('final_selected', 0)}")
+    print(f"multi-tile duplicate groups found: {result.stats.get('multi_tile_duplicate_groups_found', 0)}")
+    print(f"overlap-group finalists: {result.stats.get('final_from_overlap_groups', 0)}")
+    print(f"audit rows: {len(result.audit_rows)}")
+    print(f"wrote overlap audit: {audit_path}")
+
+    if args.suppress_overlap_sites:
+        filtered_out = src.with_name(f"{src.stem}_overlap_suppressed.csv")
+        write_csv(filtered_out, ensure_columns(result.rows))
+        print(f"wrote overlap-suppressed preview: {filtered_out}")
 
 
 def materialize_tile(
@@ -1903,20 +2557,6 @@ def main() -> None:
         raise SystemExit(f"Missing file: {pools_geojson}")
     tiles_csv = resolve_tile_csv_path(run_dir)
 
-    batch_prefix = str(args.batch_prefix)
-    if active_profile == PROFILE_V6_CORRECTIVE and batch_prefix == "google_z21_round_next":
-        batch_prefix = "z21_v6"
-    elif active_profile == PROFILE_V5_CORRECTIVE and batch_prefix == "google_z21_round_next":
-        batch_prefix = "google_z21_v5_corrective"
-
-    stamp = args.timestamp.strip() or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = out_base / f"{batch_prefix}_{stamp}"
-    if out_dir.exists():
-        if not args.overwrite:
-            raise SystemExit(f"Output folder already exists: {out_dir} (use --overwrite or a new --timestamp).")
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     print(f"[1/6] Loading run artifacts from: {run_dir}")
     tiles_df, tile_csv_dedupe_stats = load_tile_csv(tiles_csv)
     features = load_feature_table(pools_geojson)
@@ -1962,6 +2602,31 @@ def main() -> None:
             )
 
     cache = CacheBundle(image=OrderedDict(), world={}, missed_pool_signal={})
+    if args.audit_existing_csv is not None:
+        run_existing_batch_overlap_audit(
+            args=args,
+            audit_csv_path=args.audit_existing_csv,
+            tiles_df=tiles_df,
+            features=features,
+            cache=cache,
+            tiles_root=tiles_root,
+        )
+        return
+
+    batch_prefix = str(args.batch_prefix)
+    if active_profile == PROFILE_V6_CORRECTIVE and batch_prefix == "google_z21_round_next":
+        batch_prefix = "z21_v6"
+    elif active_profile == PROFILE_V5_CORRECTIVE and batch_prefix == "google_z21_round_next":
+        batch_prefix = "google_z21_v5_corrective"
+
+    stamp = args.timestamp.strip() or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = out_base / f"{batch_prefix}_{stamp}"
+    if out_dir.exists():
+        if not args.overwrite:
+            raise SystemExit(f"Output folder already exists: {out_dir} (use --overwrite or a new --timestamp).")
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     used_tile_ids: set[str] = set()
     dedupe_runtime_stats: Dict[str, int] = {
         "tiles_csv_duplicates_prevented": int(tile_csv_dedupe_stats.get("duplicates_prevented", 0)),
@@ -2181,6 +2846,20 @@ def main() -> None:
         )
         selected_frames["review_mixed_random"] = mixed
 
+    combined_candidates = build_combined_candidate_rows(selected_frames, active_buckets)
+    overlap_result = apply_overlap_site_suppression(
+        combined_candidates,
+        features=features,
+        cache=cache,
+        tiles_root=tiles_root,
+        suppress=bool(args.suppress_overlap_sites),
+        site_radius_m=float(args.site_radius_m),
+        site_overlap_iou=float(args.site_overlap_iou),
+        site_overlap_small=float(args.site_overlap_small),
+        tile_neighborhood_radius=int(args.tile_neighborhood_radius),
+    )
+    selected_frames = redistribute_combined_rows_by_bucket(overlap_result.rows, active_buckets)
+
     print("[6/6] Materializing files and writing manifests")
     combined_rows: List[pd.DataFrame] = []
     bucket_counts: Dict[str, int] = {}
@@ -2236,6 +2915,17 @@ def main() -> None:
     total_unique_tiles = int(combined["tile_id"].nunique()) if "tile_id" in combined.columns else int(len(combined))
     sample_tile_ids = combined["tile_id"].dropna().astype(str).head(8).tolist() if "tile_id" in combined.columns else []
     write_csv(out_dir / "combined_summary.csv", combined)
+    overlap_audit_path: Optional[Path] = None
+    if args.overlap_audit:
+        overlap_audit_path = resolve_overlap_audit_out_path(
+            out_dir=out_dir,
+            fallback_csv=None,
+            override=args.overlap_audit_out,
+        )
+        write_csv(
+            overlap_audit_path,
+            overlap_result.audit_rows if not overlap_result.audit_rows.empty else pd.DataFrame(columns=OVERLAP_AUDIT_COLS),
+        )
 
     params = {
         "profile": active_profile,
@@ -2280,6 +2970,15 @@ def main() -> None:
                 + dedupe_runtime_stats.get("cross_bucket_collisions_prevented", 0)
             ),
         },
+        "overlap_site_suppression": {
+            "enabled": bool(args.suppress_overlap_sites),
+            "site_radius_m": float(args.site_radius_m),
+            "site_overlap_iou": float(args.site_overlap_iou),
+            "site_overlap_small": float(args.site_overlap_small),
+            "tile_neighborhood_radius": int(args.tile_neighborhood_radius),
+            "stats": overlap_result.stats,
+            "audit_csv": str(overlap_audit_path) if overlap_audit_path is not None else "",
+        },
         "exclusions": exclusion_stats,
         "selected": bucket_counts,
         "total_unique_tiles_selected": total_unique_tiles,
@@ -2302,9 +3001,16 @@ def main() -> None:
     print(f"total_unique_tiles_selected: {total_unique_tiles}")
     for b in active_buckets:
         print(f"{b}: {bucket_counts.get(b, 0)}")
+    print("raw candidates:", int(overlap_result.stats.get("raw_candidates", 0)))
+    print("after exact dedupe:", int(overlap_result.stats.get("after_exact_dedupe", 0)))
+    print("after overlap/site suppression:", int(overlap_result.stats.get("after_overlap_site_suppression", 0)))
+    print("final selected:", int(overlap_result.stats.get("final_selected", total_unique_tiles)))
+    print("multi-tile duplicate groups found:", int(overlap_result.stats.get("multi_tile_duplicate_groups_found", 0)))
     print("skipped (duplicate in batch):", int(dedupe_runtime_stats.get("cross_bucket_collisions_prevented", 0)))
     print("final selected count:", total_unique_tiles)
     print("duplicates_prevented:", int(dedupe_runtime_stats.get("tiles_csv_duplicates_prevented", 0)) + int(dedupe_runtime_stats.get("cross_bucket_collisions_prevented", 0)))
+    if args.overlap_audit:
+        print("overlap audit csv:", overlap_audit_path)
     print("sample_tile_ids:", ", ".join(sample_tile_ids) if sample_tile_ids else "(none)")
 
 

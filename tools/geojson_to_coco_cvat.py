@@ -274,6 +274,7 @@ def main() -> None:
             skipped_no_tile_rel += 1
             continue
 
+        conf_v: Optional[float] = None
         conf = props.get("confidence")
         if conf is not None:
             try:
@@ -340,17 +341,18 @@ def main() -> None:
                 skipped_invalid_geom += 1
                 continue
 
-            annotations.append(
-                {
-                    "id": ann_id,
-                    "image_id": meta.image_id,
-                    "category_id": int(args.category_id),
-                    "segmentation": [segmentation],
-                    "area": float(area),
-                    "bbox": bbox,
-                    "iscrowd": 0,
-                }
-            )
+            ann = {
+                "id": ann_id,
+                "image_id": meta.image_id,
+                "category_id": int(args.category_id),
+                "segmentation": [segmentation],
+                "area": float(area),
+                "bbox": bbox,
+                "iscrowd": 0,
+            }
+            if conf_v is not None:
+                ann["score"] = float(conf_v)
+            annotations.append(ann)
             ann_id += 1
 
     coco = {

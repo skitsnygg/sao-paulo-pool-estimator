@@ -90,3 +90,4 @@ tmp/
 audit_report.csv
 audit_report.json
 AGENTS.md
+satellite-imagery-downloader/

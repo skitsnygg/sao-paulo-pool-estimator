@@ -17,6 +17,17 @@ from PIL import Image
 
 from tile_id_guard import canonical_rel_from_tile_id, collect_tile_ids_from_roots, extract_tile_id_from_row
 
+DEFAULT_BUCKET_TARGETS = {
+    "obvious_real_pools": 35,
+    "small_pools": 30,
+    "covered_dark_pools": 30,
+    "dense_many_pools": 30,
+    "hard_negatives_lookalikes": 40,
+    "true_empty_negatives": 35,
+    "low_conf_borderline": 30,
+}
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff")
+
 
 @dataclass(frozen=True)
 class TileRow:
@@ -76,6 +87,50 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument(
+        "--target-obvious-real-pools",
+        type=int,
+        default=DEFAULT_BUCKET_TARGETS["obvious_real_pools"],
+    )
+    ap.add_argument(
+        "--target-small-pools",
+        type=int,
+        default=DEFAULT_BUCKET_TARGETS["small_pools"],
+    )
+    ap.add_argument(
+        "--target-covered-dark-pools",
+        type=int,
+        default=DEFAULT_BUCKET_TARGETS["covered_dark_pools"],
+    )
+    ap.add_argument(
+        "--target-dense-many-pools",
+        type=int,
+        default=DEFAULT_BUCKET_TARGETS["dense_many_pools"],
+    )
+    ap.add_argument(
+        "--target-hard-negatives-lookalikes",
+        type=int,
+        default=DEFAULT_BUCKET_TARGETS["hard_negatives_lookalikes"],
+    )
+    ap.add_argument(
+        "--target-true-empty-negatives",
+        type=int,
+        default=DEFAULT_BUCKET_TARGETS["true_empty_negatives"],
+    )
+    ap.add_argument(
+        "--target-low-conf-borderline",
+        type=int,
+        default=DEFAULT_BUCKET_TARGETS["low_conf_borderline"],
+    )
+    ap.add_argument(
+        "--append-dataset-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional dataset root to update in append-only mode. Selected tile_ids are moved "
+            "from images/train+labels/train into images/val+labels/val only when val stem is absent."
+        ),
+    )
     return ap.parse_args()
 
 
@@ -234,6 +289,182 @@ def ensure_out_dir(path: Path, overwrite: bool) -> None:
             raise SystemExit(f"out-dir exists: {path} (use --overwrite)")
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def as_nonnegative_int(v: object) -> int:
+    try:
+        x = int(v)
+    except Exception:
+        return 0
+    return x if x > 0 else 0
+
+
+def find_image_by_stem(images_dir: Path, stem: str) -> Optional[Path]:
+    for ext in IMG_EXTS:
+        p = images_dir / f"{stem}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def collect_image_stems(images_dir: Path) -> Set[str]:
+    out: Set[str] = set()
+    if not images_dir.exists():
+        return out
+    for p in images_dir.iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() in IMG_EXTS:
+            out.add(p.stem)
+    return out
+
+
+def append_selected_to_dataset(
+    dataset_root: Path,
+    selected_rows: Sequence[Dict[str, object]],
+    out_dir: Path,
+) -> Dict[str, object]:
+    ds = dataset_root.expanduser().resolve()
+    img_train = ds / "images" / "train"
+    img_val = ds / "images" / "val"
+    lab_train = ds / "labels" / "train"
+    lab_val = ds / "labels" / "val"
+    required = [img_train, img_val, lab_train, lab_val]
+    missing = [p for p in required if not p.exists()]
+    if missing:
+        raise SystemExit(
+            "append-dataset-root missing expected directories: "
+            + ", ".join(str(p) for p in missing)
+        )
+
+    pre_train_stems = collect_image_stems(img_train)
+    pre_val_stems = collect_image_stems(img_val)
+    pre_overlap = len(pre_train_stems & pre_val_stems)
+    pre_train_count = len(pre_train_stems)
+    pre_val_count = len(pre_val_stems)
+
+    status_rows: List[Dict[str, str]] = []
+    moved_per_bucket: Dict[str, int] = {}
+    counters = {
+        "attempted": 0,
+        "moved": 0,
+        "skipped_existing_val": 0,
+        "skipped_missing_train_pair": 0,
+        "skipped_destination_collision": 0,
+    }
+
+    for row in selected_rows:
+        tid = str(row["tile_id"])
+        bucket = str(row["category_bucket"])
+        counters["attempted"] += 1
+
+        val_img = find_image_by_stem(img_val, tid)
+        val_lbl = lab_val / f"{tid}.txt"
+        if val_img is not None or val_lbl.exists():
+            counters["skipped_existing_val"] += 1
+            status_rows.append(
+                {
+                    "tile_id": tid,
+                    "category_bucket": bucket,
+                    "status": "skipped_existing_val",
+                    "src_train_image": "",
+                    "dst_val_image": str(val_img or ""),
+                    "src_train_label": "",
+                    "dst_val_label": str(val_lbl if val_lbl.exists() else ""),
+                }
+            )
+            continue
+
+        src_img = find_image_by_stem(img_train, tid)
+        src_lbl = lab_train / f"{tid}.txt"
+        if src_img is None or not src_lbl.exists():
+            counters["skipped_missing_train_pair"] += 1
+            status_rows.append(
+                {
+                    "tile_id": tid,
+                    "category_bucket": bucket,
+                    "status": "skipped_missing_train_pair",
+                    "src_train_image": str(src_img or ""),
+                    "dst_val_image": "",
+                    "src_train_label": str(src_lbl if src_lbl.exists() else ""),
+                    "dst_val_label": "",
+                }
+            )
+            continue
+
+        dst_img = img_val / src_img.name
+        dst_lbl = lab_val / src_lbl.name
+        if dst_img.exists() or dst_lbl.exists():
+            counters["skipped_destination_collision"] += 1
+            status_rows.append(
+                {
+                    "tile_id": tid,
+                    "category_bucket": bucket,
+                    "status": "skipped_destination_collision",
+                    "src_train_image": str(src_img),
+                    "dst_val_image": str(dst_img),
+                    "src_train_label": str(src_lbl),
+                    "dst_val_label": str(dst_lbl),
+                }
+            )
+            continue
+
+        shutil.move(str(src_img), str(dst_img))
+        shutil.move(str(src_lbl), str(dst_lbl))
+        counters["moved"] += 1
+        moved_per_bucket[bucket] = moved_per_bucket.get(bucket, 0) + 1
+        status_rows.append(
+            {
+                "tile_id": tid,
+                "category_bucket": bucket,
+                "status": "moved_train_to_val",
+                "src_train_image": str(src_img),
+                "dst_val_image": str(dst_img),
+                "src_train_label": str(src_lbl),
+                "dst_val_label": str(dst_lbl),
+            }
+        )
+
+    post_train_stems = collect_image_stems(img_train)
+    post_val_stems = collect_image_stems(img_val)
+    post_overlap = len(post_train_stems & post_val_stems)
+
+    append_manifest_path = out_dir / "append_actions.csv"
+    with append_manifest_path.open("w", encoding="utf-8", newline="") as f:
+        fieldnames = [
+            "tile_id",
+            "category_bucket",
+            "status",
+            "src_train_image",
+            "dst_val_image",
+            "src_train_label",
+            "dst_val_label",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in status_rows:
+            writer.writerow(row)
+
+    report = {
+        "dataset_root": str(ds),
+        "append_actions_csv": str(append_manifest_path),
+        "attempted_selected_rows": int(counters["attempted"]),
+        "moved_train_to_val": int(counters["moved"]),
+        "skipped_existing_val": int(counters["skipped_existing_val"]),
+        "skipped_missing_train_pair": int(counters["skipped_missing_train_pair"]),
+        "skipped_destination_collision": int(counters["skipped_destination_collision"]),
+        "moved_per_bucket": moved_per_bucket,
+        "train_count_before": int(pre_train_count),
+        "train_count_after": int(len(post_train_stems)),
+        "val_count_before": int(pre_val_count),
+        "val_count_after": int(len(post_val_stems)),
+        "train_val_overlap_before": int(pre_overlap),
+        "train_val_overlap_after": int(post_overlap),
+    }
+    append_report_path = out_dir / "append_report.json"
+    append_report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    report["append_report_json"] = str(append_report_path)
+    return report
 
 
 def main() -> None:
@@ -456,14 +687,28 @@ def main() -> None:
         ),
     )
 
+    bucket_targets = {
+        "obvious_real_pools": as_nonnegative_int(args.target_obvious_real_pools),
+        "small_pools": as_nonnegative_int(args.target_small_pools),
+        "covered_dark_pools": as_nonnegative_int(args.target_covered_dark_pools),
+        "dense_many_pools": as_nonnegative_int(args.target_dense_many_pools),
+        "hard_negatives_lookalikes": as_nonnegative_int(args.target_hard_negatives_lookalikes),
+        "true_empty_negatives": as_nonnegative_int(args.target_true_empty_negatives),
+        "low_conf_borderline": as_nonnegative_int(args.target_low_conf_borderline),
+    }
+
     buckets_plan = [
-        ("obvious_real_pools", 35, stable_unique([*obvious_primary, *obvious_fallback])),
-        ("small_pools", 30, stable_unique([*small_primary, *small_fallback])),
-        ("covered_dark_pools", 30, stable_unique([*covered_primary, *covered_fallback])),
-        ("dense_many_pools", 30, stable_unique([*dense_primary, *dense_fallback])),
-        ("hard_negatives_lookalikes", 40, stable_unique([*hard_neg_primary, *hard_neg_fallback])),
-        ("true_empty_negatives", 35, stable_unique([*empty_primary, *empty_fallback])),
-        ("low_conf_borderline", 30, stable_unique([*low_conf_primary, *low_conf_fallback])),
+        ("obvious_real_pools", bucket_targets["obvious_real_pools"], stable_unique([*obvious_primary, *obvious_fallback])),
+        ("small_pools", bucket_targets["small_pools"], stable_unique([*small_primary, *small_fallback])),
+        ("covered_dark_pools", bucket_targets["covered_dark_pools"], stable_unique([*covered_primary, *covered_fallback])),
+        ("dense_many_pools", bucket_targets["dense_many_pools"], stable_unique([*dense_primary, *dense_fallback])),
+        (
+            "hard_negatives_lookalikes",
+            bucket_targets["hard_negatives_lookalikes"],
+            stable_unique([*hard_neg_primary, *hard_neg_fallback]),
+        ),
+        ("true_empty_negatives", bucket_targets["true_empty_negatives"], stable_unique([*empty_primary, *empty_fallback])),
+        ("low_conf_borderline", bucket_targets["low_conf_borderline"], stable_unique([*low_conf_primary, *low_conf_fallback])),
     ]
 
     used_tile_ids: Set[str] = set()
@@ -532,6 +777,7 @@ def main() -> None:
         "missing_source_path": int(missing_source),
         "total_selected": int(len(selected_rows)),
         "unique_tile_ids": int(len({r["tile_id"] for r in selected_rows})),
+        "bucket_targets": bucket_targets,
         "counts_per_bucket": counts_per_bucket,
         "skipped_duplicate_in_batch": int(dup_stats["skipped_duplicate_in_batch"]),
         "tree_heavy_guard": {
@@ -539,6 +785,13 @@ def main() -> None:
             "true_empty_green_ratio_max": 0.26,
         },
     }
+    if args.append_dataset_root is not None:
+        stats["append_only_update"] = append_selected_to_dataset(
+            dataset_root=args.append_dataset_root,
+            selected_rows=selected_rows,
+            out_dir=args.out_dir,
+        )
+
     stats_path = args.out_dir / "stats.json"
     stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
 
@@ -551,6 +804,16 @@ def main() -> None:
     print(f"output images: {images_dir}")
     print(f"output manifest: {manifest_path}")
     print(f"output stats: {stats_path}")
+    if args.append_dataset_root is not None:
+        append_stats = stats.get("append_only_update", {})
+        print("append-only dataset update:")
+        print(f"  dataset_root: {append_stats.get('dataset_root', '')}")
+        print(f"  moved_train_to_val: {append_stats.get('moved_train_to_val', 0)}")
+        print(f"  skipped_existing_val: {append_stats.get('skipped_existing_val', 0)}")
+        print(f"  skipped_missing_train_pair: {append_stats.get('skipped_missing_train_pair', 0)}")
+        print(f"  train_val_overlap_before: {append_stats.get('train_val_overlap_before', 0)}")
+        print(f"  train_val_overlap_after: {append_stats.get('train_val_overlap_after', 0)}")
+        print(f"  append_actions_csv: {append_stats.get('append_actions_csv', '')}")
 
 
 if __name__ == "__main__":
